@@ -1,0 +1,16 @@
+# 统一换行：仓库内一律 LF，检出时按平台处理
+* text=auto eol=lf
+
+# 二进制文件不做换行转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.npy binary
+*.7z binary
+*.exe binary
+
+# 文档与数据
+*.md text eol=lf
+*.py text eol=lf
+*.json text eol=lf
+*.csv text eol=lf
