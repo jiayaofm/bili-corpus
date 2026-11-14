@@ -1,0 +1,36 @@
+{
+  "videos": [
+    { "bvid": "BV1Qx4g6JEsr", "domain": "娱乐", "note": "大肥鱼被弹幕骗了" },
+    { "bvid": "BV1edWM63Ewd", "domain": "科技", "note": "Claude Fable 实测" },
+    { "bvid": "BV1stZAYvELe", "domain": "美食", "note": "不可能存在方的鸡" },
+    { "bvid": "BV1w6ZEYrEsb", "domain": "美食·厨艺", "note": "下饭的最高评价" },
+    { "bvid": "BV1ArZnYUE9a", "domain": "鬼畜", "note": "晓艳天气预报" },
+    { "bvid": "BV1H5Z4YhEsn", "domain": "游戏", "note": "海龟汤" }
+  ],
+  "harvest": {
+    "order": "like",
+    "max_comments": 160,
+    "max_pages": 9,
+    "delay_sec": [3.0, 6.0]
+  },
+  "sample": {
+    "n_random": 120,
+    "seed": 20261111
+  },
+  "classify": {
+    "cv_folds": 5,
+    "cv_repeats": 10,
+    "seed": 42
+  },
+  "cluster": {
+    "k_min": 3,
+    "k_max": 12,
+    "seed": 42
+  },
+  "paths": {
+    "data": "data",
+    "labeling": "labeling",
+    "analysis": "analysis",
+    "state": "state"
+  }
+}
