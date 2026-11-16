@@ -132,6 +132,13 @@ def build(out_dir: Path, seed: int = 42, generic_ratio: float = 0.35,
     ai_rpids = {str(r["rpid"]).strip() for r in gt if str(r["label"]).strip() == "1"}
     human_rpids = {str(r["rpid"]).strip() for r in gt if str(r["label"]).strip() == "0"}
 
+    # 只按 rpid 过滤不够：同一段 AI 文本可能以**另一个 rpid** 再次出现
+    # （重复投稿/多视频共用文案）。所以再按内容做一层过滤。
+    ai_content_keys = {
+        norm_key(r["content"]) for r in gt
+        if str(r["label"]).strip() == "1" and (r.get("content") or "").strip()
+    }
+
     stats = {
         "gt_rows": len(gt),
         "gt_ai": len(ai_rpids),
@@ -175,7 +182,7 @@ def build(out_dir: Path, seed: int = 42, generic_ratio: float = 0.35,
     # 清洗 + 去重
     clean: list[dict] = []
     seen_keys: set[str] = set()
-    drop = {"noise": 0, "length": 0, "dup": 0, "empty": 0}
+    drop = {"noise": 0, "length": 0, "dup": 0, "empty": 0, "ai_content": 0}
     for source, content, topic in pool:
         t = (content or "").strip()
         if not t:
@@ -191,6 +198,9 @@ def build(out_dir: Path, seed: int = 42, generic_ratio: float = 0.35,
         k = norm_key(t)
         if not k or k in seen_keys:
             drop["dup"] += 1
+            continue
+        if k in ai_content_keys:      # 换个 rpid 重复出现的同一段 AI 文本
+            drop["ai_content"] += 1
             continue
         seen_keys.add(k)
         clean.append({"source": source, "content": t, "topic": topic,

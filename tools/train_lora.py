@@ -28,9 +28,22 @@ from pathlib import Path
 # 必须在 import transformers 之前设置。
 os.environ.setdefault("HF_HOME", r"D:\dsh-ai\lora\hf")
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
+# 减少碎片化，避免显存被 allocator 越吃越大
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 if os.environ.get("HF_MIRROR", "1") == "1":
     os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
+# 🔒 物理门禁：没有显式授权就**在 import torch 之前**退出。
+# 这台机器是用户在用的（2026-11-17 有过两次抢显存导致游戏卡死的记录），
+# 所以训练脚本必须「不可能因为一次误操作就自己跑起来」。
+if os.environ.get("DEAI_ALLOW_GPU") != "1":
+    import sys as _sys
+    _sys.stderr.write(
+        "[refuse] 未设置 DEAI_ALLOW_GPU=1，拒绝启动训练。\n"
+        "         确认可以用 GPU 后再：$env:DEAI_ALLOW_GPU='1'\n")
+    raise SystemExit(2)
+
+import subprocess
 import torch
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
@@ -51,7 +64,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--max-len", type=int, default=512)
     ap.add_argument("--epochs", type=float, default=3.0)
     ap.add_argument("--lr", type=float, default=2e-4)
-    ap.add_argument("--bs", type=int, default=2)
+    ap.add_argument("--bs", type=int, default=2,
+                    help="默认 2：实测 peak 3.19GB。bs=4 会把显存推高，"
+                         "在共用机器上不要用")
     ap.add_argument("--grad-accum", type=int, default=8)
     ap.add_argument("--lora-r", type=int, default=16)
     ap.add_argument("--lora-alpha", type=int, default=32)
@@ -62,7 +77,42 @@ def parse_args() -> argparse.Namespace:
                     help=">0 时覆盖 epochs，用于卡死时间预算")
     ap.add_argument("--limit", type=int, default=0, help=">0 时只取前 N 条")
     ap.add_argument("--no-4bit", action="store_true", help="调试用：关掉量化")
+    # ---- 安全阀：这台机器是用户在用的，不是专用训练机 ----
+    ap.add_argument("--min-free-gb", type=float, default=6.0,
+                    help="开始前要求的最小空闲显存(GB)，不够就拒绝启动")
+    ap.add_argument("--vram-frac", type=float, default=0.6,
+                    help="本进程显存上限(占总额比例)，0 表示不设上限")
+    ap.add_argument("--skip-preflight", action="store_true",
+                    help="跳过显存预检（仅在明确知道自己在干什么时用）")
     return ap.parse_args()
+
+
+def free_vram_gb() -> tuple[float, float] | None:
+    """返回 (已用 MiB, 总 MiB)；查询失败返回 None。"""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=20).stdout.strip()
+        used, total = [float(x) for x in out.splitlines()[0].split(",")]
+        return used, total
+    except Exception:
+        return None
+
+
+class VramLogger:
+    """Trainer 回调：定期把当前/峰值显存打到日志里，方便回看。"""
+
+    def __init__(self, every: int = 10, base: int = 0):
+        self.every = every
+        self.base = base
+
+    def __call__(self, step: int, logs=None) -> None:
+        if step % self.every == 0:
+            cur = torch.cuda.memory_allocated() / 1024 ** 2
+            peak = torch.cuda.max_memory_allocated() / 1024 ** 2
+            print(f"[vram] step={step} cur={cur:.0f}MiB "
+                  f"peak_alloc={peak:.0f}MiB", flush=True)
 
 
 # ---------------------------------------------------------------- 数据
@@ -127,6 +177,29 @@ def main() -> None:
         print(f"[env] gpu={torch.cuda.get_device_name(0)} "
               f"cap={torch.cuda.get_device_capability(0)}", flush=True)
 
+    # ---- 安全阀 1：开跑前查空闲显存。机器是用户在用的，不够就直接退出。
+    v = free_vram_gb()
+    if v is not None:
+        used, total = v
+        free = (total - used) / 1024
+        print(f"[preflight] vram used={used:.0f}MiB total={total:.0f}MiB "
+              f"free={free:.2f}GB (要求 >= {args.min_free_gb}GB)", flush=True)
+        if not args.skip_preflight and free < args.min_free_gb:
+            print(f"[preflight] 拒绝启动：空闲显存 {free:.2f}GB "
+                  f"< {args.min_free_gb}GB。用户的机器还在用，先别抢。",
+                  flush=True)
+            raise SystemExit(3)
+
+    # ---- 安全阀 2：给本进程设显存上限，别把整张卡吃干净。
+    if torch.cuda.is_available() and args.vram_frac > 0:
+        torch.cuda.set_per_process_memory_fraction(args.vram_frac)
+        print(f"[preflight] 本进程显存上限 {args.vram_frac*100:.0f}% "
+              f"of {torch.cuda.get_device_properties(0).total_memory/1024**3:.2f}GB",
+              flush=True)
+
+    # ---- 安全阀 3：把梯度检查点先打开，降低激活占用
+    torch.backends.cuda.matmul.allow_tf32 = True
+
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -171,6 +244,15 @@ def main() -> None:
 
     collator = build_collator(tokenizer, args.max_len)
 
+    # transformers 5.x 去掉了 warmup_ratio，只剩 warmup_steps —— 自己算。
+    if args.max_steps > 0:
+        total_steps = args.max_steps
+    else:
+        steps_per_epoch = max(1, -(-len(ds) // (args.bs * args.grad_accum)))
+        total_steps = int(steps_per_epoch * args.epochs)
+    warmup_steps = max(1, int(total_steps * args.warmup_ratio))
+    print(f"[sched] total_steps={total_steps} warmup_steps={warmup_steps}", flush=True)
+
     targs = TrainingArguments(
         output_dir=str(out / "ckpt"),
         per_device_train_batch_size=args.bs,
@@ -179,7 +261,7 @@ def main() -> None:
         max_steps=args.max_steps,
         learning_rate=args.lr,
         lr_scheduler_type="cosine",
-        warmup_ratio=args.warmup_ratio,
+        warmup_steps=warmup_steps,
         logging_steps=5,
         save_strategy="no",
         bf16=True,
@@ -201,6 +283,19 @@ def main() -> None:
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
+
+    # 定期打显存，方便回看是不是在悄悄涨
+    from transformers import TrainerCallback
+
+    class _VramCB(TrainerCallback):
+        def on_log(self, a, state, control, logs=None, **kw):
+            if state.global_step and state.global_step % 10 == 0:
+                cur = torch.cuda.memory_allocated() / 1024 ** 2
+                peak = torch.cuda.max_memory_allocated() / 1024 ** 2
+                print(f"[vram] step={state.global_step} cur={cur:.0f}MiB "
+                      f"peak_alloc={peak:.0f}MiB", flush=True)
+
+    trainer.add_callback(_VramCB())
 
     t0 = time.time()
     result = trainer.train()
