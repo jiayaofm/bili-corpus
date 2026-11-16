@@ -78,14 +78,53 @@ def _load_map(path):
     return {int(it["编号_int"]): it for it in amap["items"]}
 
 
+def _load_existing():
+    """读取现有真值 + 全部历史备份，合并。
+
+    历史备份先读、当前文件后读，所以当前文件的名字会覆盖备份里的同名条目。
+    这是为了避免早期版本"每批覆盖前一批"造成的数据丢失。
+    """
+    out = {}
+    for bak in sorted(P["state"].glob("ground_truth_backup_*.csv")):
+        for r in _read_csv(bak):
+            r.setdefault("source", "backup")
+            out[r["rpid"]] = r
+    cur = common.ROOT / OUT_REL
+    if cur.exists():
+        for r in _read_csv(cur):
+            r.setdefault("source", "existing")
+            out[r["rpid"]] = r
+    return out
+
+
+GT_FIELDS = ["rpid", "label", "strength", "was_candidate", "content", "source"]
+
+
 def _write_gt(pairs, source):
-    """pairs: [(rpid, label, strength, was_candidate, content)]"""
+    """合并写入：本批标签覆盖同名旧标签，未出现在本批的旧标注保留。
+
+    pairs: [(rpid, label, strength, was_candidate, content)]
+    返回合并后的总条数。
+    """
+    existing = _load_existing()
+    kept = len(existing)
+
+    for rpid, label, strength, was_candidate, content in pairs:
+        existing[rpid] = {
+            "rpid": rpid, "label": label, "strength": strength,
+            "was_candidate": was_candidate, "content": content, "source": source,
+        }
+
+    rows = list(existing.values())
     with (common.ROOT / OUT_REL).open("w", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f)
-        w.writerow(["rpid", "label", "strength", "was_candidate", "content"])
-        for row in pairs:
-            w.writerow(row)
-    info(f"写入 {OUT_REL}  共 {len(pairs)} 条（来源：{source}）")
+        w = csv.DictWriter(f, fieldnames=GT_FIELDS, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+
+    added = len(rows) - kept
+    info(f"写入 {OUT_REL}  合并后 {len(rows)} 条"
+         f"（本批 {len(pairs)}，新增 {added}，保留历史 {kept}）")
+    return len(rows)
 
 
 def _backup_existing():
@@ -136,9 +175,8 @@ def main(force=False):
                     lab, st = 0, ""
                 pairs.append([it["rpid"], lab, st, it["was_candidate"],
                               content.get(num, "")])
-            _write_gt(pairs, "blind_sample.csv")
-            judged = len(certain) + len(maybe) + len(human)
-            info(f"明确AI {len(certain)} / 疑似 {len(maybe)} / 真人 {len(human)}")
+            judged = _write_gt(pairs, "blind_sample.csv")
+            info(f"本批：明确AI {len(certain)} / 疑似 {len(maybe)} / 真人 {len(human)}")
         else:
             info("[提示] blind_sample.csv 还没有任何标注")
 

@@ -182,6 +182,28 @@ def _f_url(c, u):
 #   句末闭合   AI 43% vs 真人 10%
 #   短分句占比 AI 4%  vs 真人 12%
 #   分句数     AI 4.65 vs 真人 3.50
+FILLER_RE = re.compile(r"[啊吧咯哈呢呀嘛呗哦嘿唉哎呐噢哇]")
+ASK_RE = re.compile(r"(?:大佬|求|有没有|请问|谁能|怎么|为什么|吗)")
+
+
+def _f_filler_density(c, u):
+    """语气词密度（每百字）——真人说话带尾巴，AI 不带"""
+    return len(FILLER_RE.findall(c)) / max(len(c), 1) * 100
+
+
+def _f_ask_density(c, u):
+    """提问/求教密度（每百字）——真人是来问的，AI 是来答的"""
+    return len(ASK_RE.findall(c)) / max(len(c), 1) * 100
+
+
+# ---------------- I 人味类 ----------------
+# 前面 7 组几乎全是「AI 有而人没有」的负向记号，这一组反过来：
+# 真人身上常见、AI 几乎不用的正向表达习惯。
+# 实测（263 条人工真值，每百字密度）：
+#   提问求教  AI 0.1% vs 真人 0.6%   （4.0 倍）
+#   语气词    AI 0.2% vs 真人 0.8%   （2.2 倍）
+# 注意：另外测过 6 个候选（第一人称、口语词、重复字、自嘲、
+# 不规范标点、颜文字），差异都在噪声内，没有加进来。
 def _f_closed_end(c, u):
     """句末有终止标点 —— 意思说尽了"""
     return int(bool(re.search(r"[。！？~]\s*$", c)))
@@ -258,6 +280,9 @@ FEATURES = [
     ("H 闭合类", "平均分句长", _f_seg_avg),
     ("H 闭合类", "短分句占比", _f_short_seg_ratio),
     ("H 闭合类", "数字密度", _f_digit_density),
+
+    ("I 人味类", "语气词密度", _f_filler_density),
+    ("I 人味类", "提问密度", _f_ask_density),
 ]
 
 NAMES = [n for _, n, _ in FEATURES]
@@ -267,7 +292,7 @@ for g, n, _ in FEATURES:
 
 # 分类用：默认去掉账号类（混淆变量），需要时单独打开
 CLASSIFY_GROUPS = ["A 符号类", "B 句式类", "C 人设类", "D 结构类",
-                   "F 标点类", "G 其他", "H 闭合类"]
+                   "F 标点类", "G 其他", "H 闭合类", "I 人味类"]
 
 # 聚类用：连续型风格特征，不含任何话题词
 STYLE_COLS = [
