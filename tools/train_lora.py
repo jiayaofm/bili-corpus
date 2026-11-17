@@ -263,7 +263,10 @@ def main() -> None:
         lr_scheduler_type="cosine",
         warmup_steps=warmup_steps,
         logging_steps=5,
-        save_strategy="no",
+        # 每个 epoch 都存一次：上次 save_strategy="no" 被杀后零产物，
+        # 这次就算中途断电，至少有上一轮的 adapter。
+        save_strategy="epoch",
+        save_total_limit=2,
         bf16=True,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
