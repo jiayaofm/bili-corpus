@@ -49,6 +49,17 @@ URL_RE = re.compile(r"(?:https?://|www\.)\S+")
 BILI_EMO_RE = re.compile(r"\[[^\[\]]{1,10}\]")
 
 
+# 已知 AI 号：二级回复里它们可能自己回自己。
+# GrokBot 有独立标注文件（labeling/grokbot_ai.csv，28 条确认是 AI），
+# 鲸府大肥鱼 是本项目追踪的人格号本体。
+# 其余名字里带「鱼/鲸」的大多是仿号的人类（比如「DeepSeek大肥鱼-真人版」），
+# 不做模糊匹配，只按精确用户名剔除。
+BOT_USERS = {
+    "GrokBot打工日记",
+    "鲸府大肥鱼",
+}
+
+
 def _strip_noise(text: str) -> str:
     """剥掉表情/at/链接/标点，用于判断「是不是纯噪声」。"""
     s = BILI_EMO_RE.sub("", text)
@@ -105,6 +116,12 @@ def load_gt() -> list[dict]:
 
 
 def load_jsonl_comments() -> list[dict]:
+    """顶层评论 + 二级回复都摊平。
+
+    二级回复有 1374 条，比顶层还多，是把语料翻倍最直接的来源。
+    但它们没有自己的 rpid，而且可能是 AI 号回的，所以打上 `_is_reply` 标记，
+    由 build() 按用户名把已知机器人剔掉。
+    """
     rows = []
     for p in sorted(glob.glob(str(ROOT / "data" / "BV*_like.jsonl"))):
         with open(p, encoding="utf-8") as f:
@@ -116,7 +133,19 @@ def load_jsonl_comments() -> list[dict]:
                     d = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                d["_is_reply"] = False
                 rows.append(d)
+                for i, sr in enumerate(d.get("sub_replies") or []):
+                    c = (sr.get("content") or "").strip()
+                    if not c:
+                        continue
+                    rows.append({
+                        "rpid": "sub:%s:%d" % (d.get("rpid", ""), i),
+                        "content": c,
+                        "user": sr.get("user") or "",
+                        "video_title": d.get("video_title") or "",
+                        "_is_reply": True,
+                    })
     return rows
 
 
@@ -157,6 +186,7 @@ def build(out_dir: Path, seed: int = 42, generic_ratio: float = 0.35,
     # 候选池：jsonl 里未被标为 AI 的 + gt 里标为人人的
     pool: list[tuple[str, str, str]] = []  # (source, content, topic)
     seen_rpid: set[str] = set()
+    bot_skipped = 0
 
     for d in raw:
         rp = str(d.get("rpid", "")).strip()
@@ -165,8 +195,14 @@ def build(out_dir: Path, seed: int = 42, generic_ratio: float = 0.35,
             continue
         if rp in ai_rpids:          # 去掉已确认的 AI 评论
             continue
+        if d.get("_is_reply") and (d.get("user") or "") in BOT_USERS:
+            bot_skipped += 1        # 二级回复里 AI 号自己回的
+            continue
         seen_rpid.add(rp)
-        pool.append(("jsonl", content, title_by_rpid.get(rp, "")))
+        pool.append(("jsonl" if not d.get("_is_reply") else "reply",
+                     content, title_by_rpid.get(rp, "")))
+
+    stats["bot_user_skipped"] = bot_skipped
 
     for r in gt:
         rp = str(r["rpid"]).strip()
