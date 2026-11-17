@@ -60,6 +60,13 @@ BOT_USERS = {
 }
 
 
+# 二级回复常以「回复 @某人 :」或「@某人 」开头，这是**回复格式**，
+# 而本任务生成的是**顶层评论**——真人顶层评论里这个比例是 0%。
+# 2026-11-17 实测：不处理的话模型会输出 21% 的「回复 @xxx」。
+# 两种处理：整条丢掉（--no-replies），或只剥掉前缀保留正文（--strip-reply-prefix）。
+REPLY_PREFIX_RE = re.compile(r"^\s*(?:回复\s*)?@[^\s:：]{1,25}\s*[:：]?\s*")
+
+
 def _strip_noise(text: str) -> str:
     """剥掉表情/at/链接/标点，用于判断「是不是纯噪声」。"""
     s = BILI_EMO_RE.sub("", text)
@@ -152,6 +159,7 @@ def load_jsonl_comments() -> list[dict]:
 # ---------------------------------------------------------------- 主逻辑
 
 def build(out_dir: Path, seed: int = 42, generic_ratio: float = 0.35,
+          no_replies: bool = False, strip_reply_prefix: bool = False,
           holdout: int = 20) -> dict:
     rng = random.Random(seed)
     gt = load_gt()
@@ -187,6 +195,8 @@ def build(out_dir: Path, seed: int = 42, generic_ratio: float = 0.35,
     pool: list[tuple[str, str, str]] = []  # (source, content, topic)
     seen_rpid: set[str] = set()
     bot_skipped = 0
+    reply_dropped = 0
+    prefix_stripped = 0
 
     for d in raw:
         rp = str(d.get("rpid", "")).strip()
@@ -195,14 +205,25 @@ def build(out_dir: Path, seed: int = 42, generic_ratio: float = 0.35,
             continue
         if rp in ai_rpids:          # 去掉已确认的 AI 评论
             continue
-        if d.get("_is_reply") and (d.get("user") or "") in BOT_USERS:
+        is_reply = bool(d.get("_is_reply"))
+        if is_reply and (d.get("user") or "") in BOT_USERS:
             bot_skipped += 1        # 二级回复里 AI 号自己回的
             continue
+        if is_reply and no_replies:
+            reply_dropped += 1
+            continue
+        if is_reply and strip_reply_prefix:
+            content2 = REPLY_PREFIX_RE.sub("", content or "")
+            if content2 != (content or ""):
+                prefix_stripped += 1
+            content = content2
         seen_rpid.add(rp)
-        pool.append(("jsonl" if not d.get("_is_reply") else "reply",
+        pool.append(("jsonl" if not is_reply else "reply",
                      content, title_by_rpid.get(rp, "")))
 
     stats["bot_user_skipped"] = bot_skipped
+    stats["reply_dropped"] = reply_dropped
+    stats["reply_prefix_stripped"] = prefix_stripped
 
     for r in gt:
         rp = str(r["rpid"]).strip()
@@ -307,9 +328,14 @@ def main() -> None:
     ap.add_argument("--generic-ratio", type=float, default=0.35,
                     help="用泛化指令（无话题）的比例")
     ap.add_argument("--holdout", type=int, default=20)
+    ap.add_argument("--no-replies", action="store_true", help="丢掉全部二级回复")
+    ap.add_argument("--strip-reply-prefix", action="store_true", help="剥掉二级回复的「回复 @某人 :」前缀")
+    ap.add_argument("--tag", default="", help="写进 stats 方便区分")
+
     a = ap.parse_args()
     stats = build(Path(a.out), seed=a.seed,
-                  generic_ratio=a.generic_ratio, holdout=a.holdout)
+                  generic_ratio=a.generic_ratio, holdout=a.holdout,
+        no_replies=a.no_replies, strip_reply_prefix=a.strip_reply_prefix)
     print(json.dumps(stats, ensure_ascii=False, indent=2))
 
 
