@@ -25,6 +25,9 @@ def main(force=False):
     order = CFG["harvest"]["order"]
 
     files = sorted(P["data"].glob(f"*_{order}.jsonl"))
+    # 深采（tools/deep_fetch.py）的产物：data/deep/<BV>.jsonl
+    # 早期每个视频只取 160 条，深采后能到 2000 条。两路合并、按 rpid 去重。
+    files += sorted((P["data"] / "deep").glob("*.jsonl")) if (P["data"] / "deep").is_dir() else []
     if not files:
         info("[失败] data/ 下没有抓到任何 jsonl，请先跑 s01")
         return 1
@@ -35,7 +38,13 @@ def main(force=False):
     skipped_dup = 0
 
     for fp in files:
+        # data/BV1xxx_like.jsonl → BV1xxx ；data/deep/BV1xxx.jsonl → BV1xxx
+        # 深采还有 <BV>-time.jsonl（时间序对照样本），不并入主语料，避免和热度序重复
+        if fp.name.endswith("-time.jsonl"):
+            continue
         bvid = fp.name.split("_")[0]
+        if bvid.endswith(".jsonl"):
+            bvid = bvid[:-6]
         n = 0
         for r in read_jsonl(fp):
             rpid = str(r.get("rpid", ""))
