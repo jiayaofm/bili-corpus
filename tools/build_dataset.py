@@ -31,10 +31,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 GT_CSV = ROOT / "labeling" / "ground_truth.csv"
 
-# 指令模板。system 固定，user 二选一。
+# 指令模板。system 固定，user 三选一。
 SYSTEM = "你在 B 站评论区发一条真实的短评。"
 USER_TOPIC = "关于「{topic}」这个话题，说一句你的看法。"
 USER_GENERIC = "说一句你此刻想说的话。"
+# 有摘要时用这个：把「这个视频讲了什么」当输入，而不是干巴巴一个标题。
+# 这是本项目的核心假设——模型需要看得见视频内容，才写得出不空心的评论。
+USER_SUMMARY = (
+    "视频《{title}》讲的是：{summary}\n"
+    "\n"
+    "就这条视频，说一句你的看法。"
+)
 
 # ---------------------------------------------------------------- 清洗规则
 
@@ -44,6 +51,10 @@ EMOJI_RE = re.compile(
     "]+"
 )
 AT_RE = re.compile(r"@[^\s@]{1,30}")
+# 行首的 @某人（可能连着好几个）。扩采来的评论里有 11.4% 是这个形状 ——
+# 那是评论区里手动 @ 别人的回复，不是独立顶层评论。
+# 本任务生成的是顶层评论，所以训练目标里要剥掉。
+AT_PREFIX_RE = re.compile(r"^(?:\s*@[^\s@]{1,30}\s*)+")
 URL_RE = re.compile(r"(?:https?://|www\.)\S+")
 # B站表情名：[doge] 这种
 BILI_EMO_RE = re.compile(r"\[[^\[\]]{1,10}\]")
@@ -130,7 +141,17 @@ def load_jsonl_comments() -> list[dict]:
     由 build() 按用户名把已知机器人剔掉。
     """
     rows = []
-    for p in sorted(glob.glob(str(ROOT / "data" / "BV*_like.jsonl"))):
+    # 两路来源：
+    #   data/BV*_like.jsonl  早期采集（160 条/视频，按热度取，带 sub_replies）
+    #   data/deep/*.jsonl    深采（tools/deep_fetch.py，最多上千条/视频，只有顶层）
+    # 重复的 rpid 会在 build() 里靠 seen_rpid 去重。
+    sources = (sorted(glob.glob(str(ROOT / "data" / "BV*_like.jsonl")))
+               + sorted(glob.glob(str(ROOT / "data" / "deep" / "*.jsonl"))))
+    for p in sources:
+        # 文件名去掉扩展名后取 bvid：
+        #   data/BV1xxx_like.jsonl  → BV1xxx_like  → split('_') → BV1xxx
+        #   data/deep/BV1xxx.jsonl  → BV1xxx
+        bvid = Path(p).stem.split("_")[0].split("-")[0]
         with open(p, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -141,6 +162,7 @@ def load_jsonl_comments() -> list[dict]:
                 except json.JSONDecodeError:
                     continue
                 d["_is_reply"] = False
+                d["bvid"] = bvid
                 rows.append(d)
                 for i, sr in enumerate(d.get("sub_replies") or []):
                     c = (sr.get("content") or "").strip()
@@ -151,6 +173,7 @@ def load_jsonl_comments() -> list[dict]:
                         "content": c,
                         "user": sr.get("user") or "",
                         "video_title": d.get("video_title") or "",
+                        "bvid": bvid,
                         "_is_reply": True,
                     })
     return rows
@@ -158,9 +181,23 @@ def load_jsonl_comments() -> list[dict]:
 
 # ---------------------------------------------------------------- 主逻辑
 
+def load_summaries() -> dict[str, dict]:
+    """读 data/summaries/<bvid>.json，返回 {bvid: {summary, title, confidence}}。"""
+    out: dict[str, dict] = {}
+    for p in sorted(glob.glob(str(ROOT / "data" / "summaries" / "*.json"))):
+        try:
+            d = json.loads(Path(p).read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if d.get("bvid") and (d.get("summary") or "").strip():
+            out[d["bvid"]] = d
+    return out
+
+
 def build(out_dir: Path, seed: int = 42, generic_ratio: float = 0.35,
           no_replies: bool = False, strip_reply_prefix: bool = False,
-          holdout: int = 20) -> dict:
+          holdout: int = 20, with_summary: bool = False,
+          drop_at: bool = False) -> dict:
     rng = random.Random(seed)
     gt = load_gt()
     raw = load_jsonl_comments()
@@ -185,14 +222,17 @@ def build(out_dir: Path, seed: int = 42, generic_ratio: float = 0.35,
 
     # rpid -> video_title（来自抓取数据）
     title_by_rpid: dict[str, str] = {}
+    bvid_by_rpid: dict[str, str] = {}
     for d in raw:
         rp = str(d.get("rpid", "")).strip()
         t = (d.get("video_title") or "").strip()
         if rp and t:
             title_by_rpid[rp] = t
+        if rp and d.get("bvid"):
+            bvid_by_rpid[rp] = d["bvid"]
 
     # 候选池：jsonl 里未被标为 AI 的 + gt 里标为人人的
-    pool: list[tuple[str, str, str]] = []  # (source, content, topic)
+    pool: list[tuple[str, str, str, str]] = []  # (source, content, topic, bvid)
     seen_rpid: set[str] = set()
     bot_skipped = 0
     reply_dropped = 0
@@ -219,7 +259,7 @@ def build(out_dir: Path, seed: int = 42, generic_ratio: float = 0.35,
             content = content2
         seen_rpid.add(rp)
         pool.append(("jsonl" if not is_reply else "reply",
-                     content, title_by_rpid.get(rp, "")))
+                     content, title_by_rpid.get(rp, ""), bvid_by_rpid.get(rp, "")))
 
     stats["bot_user_skipped"] = bot_skipped
     stats["reply_dropped"] = reply_dropped
@@ -232,7 +272,8 @@ def build(out_dir: Path, seed: int = 42, generic_ratio: float = 0.35,
         if str(r["label"]).strip() != "0":
             continue
         seen_rpid.add(rp)
-        pool.append(("gt", r.get("content") or "", title_by_rpid.get(rp, "")))
+        pool.append(("gt", r.get("content") or "",
+                     title_by_rpid.get(rp, ""), bvid_by_rpid.get(rp, "")))
 
     stats["pool_after_ai_filter"] = len(pool)
 
@@ -240,7 +281,7 @@ def build(out_dir: Path, seed: int = 42, generic_ratio: float = 0.35,
     clean: list[dict] = []
     seen_keys: set[str] = set()
     drop = {"noise": 0, "length": 0, "dup": 0, "empty": 0, "ai_content": 0}
-    for source, content, topic in pool:
+    for source, content, topic, bvid in pool:
         t = (content or "").strip()
         if not t:
             drop["empty"] += 1
@@ -248,6 +289,14 @@ def build(out_dir: Path, seed: int = 42, generic_ratio: float = 0.35,
         if is_noise(t):
             drop["noise"] += 1
             continue
+        if drop_at:
+            t2 = AT_PREFIX_RE.sub("", t).strip()
+            if t2 != t:
+                drop["at_stripped"] = drop.get("at_stripped", 0) + 1
+                if char_len(t2) < 6:      # 剥完只剩几个字，是纯 @ 或寒暄，丢掉
+                    drop["at_too_short"] = drop.get("at_too_short", 0) + 1
+                    continue
+                t = t2
         n = char_len(t)
         if n < 4 or n > 300:
             drop["length"] += 1
@@ -261,7 +310,7 @@ def build(out_dir: Path, seed: int = 42, generic_ratio: float = 0.35,
             continue
         seen_keys.add(k)
         clean.append({"source": source, "content": t, "topic": topic,
-                      "chars": n})
+                      "bvid": bvid, "chars": n})
 
     stats["cleaned"] = len(clean)
     stats["dropped"] = drop
@@ -274,11 +323,23 @@ def build(out_dir: Path, seed: int = 42, generic_ratio: float = 0.35,
     train_rows = clean[holdout:]
 
     # 构造对话样本
+    summaries = load_summaries() if with_summary else {}
+
     def to_sample(rec: dict) -> dict:
         topic = rec["topic"]
-        # 有真实话题时，多数用话题式；否则/少数用泛化式
-        use_topic = bool(topic) and rng.random() > generic_ratio
-        user = USER_TOPIC.format(topic=topic) if use_topic else USER_GENERIC
+        sm = summaries.get(rec.get("bvid") or "")
+        if sm:
+            # 有摘要：把「视频讲了什么」当输入。这是本项目的核心假设——
+            # 模型得看见内容，才写得出不空心的评论。
+            user = USER_SUMMARY.format(title=topic or sm.get("title") or "",
+                                       summary=sm["summary"].strip())
+            style = "summary"
+        elif topic and rng.random() > generic_ratio:
+            user = USER_TOPIC.format(topic=topic)
+            style = "topic"
+        else:
+            user = USER_GENERIC
+            style = "generic"
         return {
             "messages": [
                 {"role": "system", "content": SYSTEM},
@@ -286,8 +347,9 @@ def build(out_dir: Path, seed: int = 42, generic_ratio: float = 0.35,
                 {"role": "assistant", "content": rec["content"]},
             ],
             "_meta": {"source": rec["source"], "chars": rec["chars"],
-                      "topic": topic if use_topic else "",
-                      "style": "topic" if use_topic else "generic"},
+                      "bvid": rec.get("bvid") or "",
+                      "topic": topic if style != "generic" else "",
+                      "style": style},
         }
 
     train_samples = [to_sample(r) for r in train_rows]
@@ -309,9 +371,10 @@ def build(out_dir: Path, seed: int = 42, generic_ratio: float = 0.35,
     stats["train"] = len(train_samples)
     stats["holdout"] = len(eval_samples)
     stats["style_counts"] = {
-        "topic": sum(1 for s in train_samples if s["_meta"]["style"] == "topic"),
-        "generic": sum(1 for s in train_samples if s["_meta"]["style"] == "generic"),
+        k: sum(1 for s in train_samples if s["_meta"]["style"] == k)
+        for k in ("summary", "topic", "generic")
     }
+    stats["summaries_loaded"] = len(summaries)
     stats["train_sha256"] = hashlib.sha256(train_path.read_bytes()).hexdigest()
     stats["train_path"] = str(train_path)
     stats["eval_path"] = str(eval_path)
@@ -330,12 +393,17 @@ def main() -> None:
     ap.add_argument("--holdout", type=int, default=20)
     ap.add_argument("--no-replies", action="store_true", help="丢掉全部二级回复")
     ap.add_argument("--strip-reply-prefix", action="store_true", help="剥掉二级回复的「回复 @某人 :」前缀")
+    ap.add_argument("--drop-at", action="store_true",
+                    help="剥掉行首的 @某人（扩采数据里 11% 是这种回复，不是顶层评论）")
+    ap.add_argument("--with-summary", action="store_true",
+                    help="用 data/summaries/ 里的视频摘要当输入（没有摘要的评论回落到标题式/泛化式）")
     ap.add_argument("--tag", default="", help="写进 stats 方便区分")
 
     a = ap.parse_args()
     stats = build(Path(a.out), seed=a.seed,
                   generic_ratio=a.generic_ratio, holdout=a.holdout,
-        no_replies=a.no_replies, strip_reply_prefix=a.strip_reply_prefix)
+        no_replies=a.no_replies, strip_reply_prefix=a.strip_reply_prefix,
+        with_summary=a.with_summary, drop_at=a.drop_at)
     print(json.dumps(stats, ensure_ascii=False, indent=2))
 
 

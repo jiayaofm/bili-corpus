@@ -75,16 +75,43 @@ PROMPTS = {"v1": GEN_SYSTEM_V1, "v2": GEN_SYSTEM_V2}
 # 用它评估会把「评估方式错了」误读成「训练把模型带坏了」。
 GEN_SYSTEM_TRAIN = "你在 B 站评论区发一条真实的短评。"
 PROMPTS["train"] = GEN_SYSTEM_TRAIN
+# summary：和 gen3 训练格式完全一致（system 同 train，user 带摘要）
+PROMPTS["summary"] = GEN_SYSTEM_TRAIN
 
 # 每种 prompt 对应的 user 模板（train 不加分区、不加任何分布要求）
 USER_TEMPLATES = {
     "train": "关于「{title}」这个话题，说一句你的看法。",
+    "summary": "视频《{title}》讲的是：{summary}\\n\\n就这条视频，说一句你的看法。",
     "v1": "《{title}》，分区：{domain}",
     "v2": "《{title}》，分区：{domain}",
 }
 
 
-def build_user_msg(prompt: str, title: str, domain: str) -> str:
+def load_summaries() -> dict:
+    """读 data/summaries/<bvid>.json → {bvid: summary}。"""
+    import json as _json
+    from pathlib import Path as _P
+    out = {}
+    d = _P(__file__).resolve().parent.parent / "data" / "summaries"
+    for f in sorted(d.glob("*.json")):
+        try:
+            j = _json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if j.get("bvid") and (j.get("summary") or "").strip():
+            out[j["bvid"]] = j["summary"].strip()
+    return out
+
+
+SUMMARIES = load_summaries()
+
+
+def build_user_msg(prompt: str, title: str, domain: str, bv: str = "") -> str:
+    if prompt == "summary":
+        s = SUMMARIES.get(bv, "")
+        if not s:
+            raise SystemExit(f"[error] {bv} 没有摘要，先跑 tools/fetch_materials.py 和写摘要")
+        return USER_TEMPLATES["summary"].format(title=title, summary=s)
     return USER_TEMPLATES[prompt].format(title=title, domain=domain)
 
 # 用户/lead 给的真人实测值（**按视频等权平均**算的），用于最后对照
@@ -315,7 +342,7 @@ def main() -> None:
     for vi, (bv, title, dom, nreal) in enumerate(items, 1):
         msgs = [
             {"role": "system", "content": PROMPTS[a.prompt]},
-            {"role": "user", "content": build_user_msg(a.prompt, title, dom)},
+            {"role": "user", "content": build_user_msg(a.prompt, title, dom, bv)},
         ]
         gens = generate_many(tok, model, msgs, a.n, a.temperature,
                              a.max_new_tokens)
