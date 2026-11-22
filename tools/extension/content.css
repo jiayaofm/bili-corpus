@@ -1,0 +1,104 @@
+﻿/* B站评论 AI 味检测 —— 注入样式
+   原则：不改变页面原有布局，徽标与按钮都是行内元素，只占一小行。 */
+
+.dsh-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 2px 0 4px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.dsh-badges {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.dsh-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #fff;
+  cursor: help;
+  white-space: nowrap;
+  opacity: 0.92;
+}
+
+/* 通用 AI 腔 */
+.dsh-ai-low    { background: #4a9e6a; }
+.dsh-ai-medium { background: #c99021; }
+.dsh-ai-high   { background: #c0392b; }
+
+/* 鱼腥味（用蓝系区分，避免和 AI 腔混淆） */
+.dsh-fish-na    { background: #c8ccd2; opacity: 0.7; }
+
+.dsh-fish-low    { background: #4a7fa5; opacity: 0.55; }
+.dsh-fish-medium { background: #3a6fa0; }
+.dsh-fish-high   { background: #23558c; }
+
+.dsh-rw {
+  border: 1px solid #3a6fa0;
+  background: #fff;
+  color: #23558c;
+  border-radius: 8px;
+  font-size: 11px;
+  padding: 1px 8px;
+  cursor: pointer;
+  line-height: 1.5;
+}
+.dsh-rw:hover:not(:disabled) { background: #eef4fa; }
+.dsh-rw:disabled { opacity: 0.6; cursor: default; }
+
+.dsh-rw-box {
+  margin: 4px 0 6px;
+  padding: 8px 10px;
+  border-left: 3px solid #3a6fa0;
+  background: #f6f9fc;
+  border-radius: 0 6px 6px 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #333;
+}
+.dsh-rw-out { font-weight: 500; }
+.dsh-rw-meta {
+  margin-top: 4px;
+  font-size: 11px;
+  color: #667;
+}
+
+/* 右上角状态条 */
+.dsh-pill {
+  position: fixed;
+  top: 72px;
+  right: 12px;
+  z-index: 99999;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: rgba(255, 255, 255, 0.96);
+  border: 1px solid #d8dee6;
+  border-radius: 10px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12);
+  font-size: 12px;
+  color: #333;
+}
+.dsh-pill b { font-weight: 600; }
+.dsh-pill-stat { color: #556; }
+.dsh-pill-stat.dsh-err { color: #c0392b; }
+.dsh-pill-tg {
+  border: 1px solid #d8dee6;
+  background: #fafbfc;
+  border-radius: 6px;
+  font-size: 11px;
+  padding: 1px 7px;
+  cursor: pointer;
+}
+
+/* 隐藏态：只藏徽标和按钮，状态条保留 */
+body.dsh-off .dsh-head,
+body.dsh-off .dsh-rw-box { display: none !important; }

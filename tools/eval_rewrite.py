@@ -1,298 +1,417 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""三方对比：Qwen3-1.7B 原始 / +LoRA / qwen3:8b（Ollama）。
+"""
+改写效果评测：训出来的模型到底有没有把「鱼腥味」去掉，内容有没有丢。
 
-用项目自己的 GEN_SYSTEM（pipeline/llm.py 的十条硬规则）+ 项目自己的
-第 1 轮改写指令（pipeline/rewrite.py 的 build_instruction），
-保证三条基线看到的是同一个 prompt —— 只换模型，不换题。
+## 四个指标，缺一不可
 
-生成方式说明
-------------
-GEN_USER 原本请求「写 {n} 个版本，每行一个」，但 1.7B 这种小模型基本不遵守，
-会把「3 个版本」写成 1 段。为了保证「换模型不换题」的公平性，这里统一
-**独立采样 3 次**（每次 prompt 里 n=1），拿 3 个候选。
-这样对比的是「模型的改写能力」，不是「能不能遵守多行输出格式」。
+| 指标 | 测什么 | 为什么要 |
+|---|---|---|
+| **鱼腥味** | 输出还像不像大肥鱼 | 本项目的核心目标 |
+| **内容保留** | 输入里说的东西还在不在 | 早期 pipeline 就是死在这（5.7%） |
+| **P(AI)** | 有没有掉回「通用 AI 腔」 | 防止修好一个坏掉另一个 |
+| **形态** | 长度/表情/骨架重复 | 输出得像正常人写的 |
 
-用法：
-  python eval_rewrite.py --tag base            # 只跑底座
-  python eval_rewrite.py --tag lora --adapter <dir>
-  python eval_rewrite.py --tag qwen3-8b --ollama qwen3:8b
-  python eval_rewrite.py --all                 # 三种一起跑
+只报一个指标一定会骗自己——尤其「鱼腥味降了」通常靠「写得更短更空」就能做到。
+
+## 两种输入方式
+
+```bash
+# ① 已有预测结果（不占 GPU，先验指标逻辑用）
+python -X utf8 tools/eval_rewrite.py --predictions pred.jsonl
+
+# ② 直接加载 adapter 生成（占 GPU）
+python -X utf8 tools/eval_rewrite.py --adapter D:\\dsh-ai\\lora\\out\\qwen3-1.7b-fish \\
+    --data data/rewrite/b_dev.jsonl
+```
+
+`--predictions` 每行：`{"bvid": "...", "x": "鱼腔输入", "y": "真人目标", "pred": "模型输出"}`
+
+## 鱼腥味检测器怎么来的
+
+用**同一批训练数据**里未参与本评测的样本训一个二分类器：
+
+```
+正类  x（鱼腔改写）     负类  y（真人原话）
+特征  字符 TF-IDF 1-3gram
+```
+
+然后给模型输出打分。**分数越低 = 越不像鱼。**
+
+**注意**：如果模型输出和训练时的 x 高度相似（比如模型学会了「抄输入」），
+鱼腥味分数会显得很高——这反而是对的，说明它没改。
+
+## 内容保留怎么算
+
+从输入 x 里抽「可核查的具体信息」：
+
+- 阿拉伯数字（含百分比、金额、单位前缀）
+- 拉丁字母/英文词
+- 汉字 bigram（去掉纯虚词组合）
+
+然后看这些在输出里还剩多少。同时也报「相对 y 的保留率」当参照——
+因为 y 本身就是「正确改写后该有的样子」，理想情况下输出应该跟 y 一样全。
+
+## 拒绝出数
+
+样本数不够时直接报错，不打印虚指标（和 persona_detector.py 一个规矩）。
 """
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
+import statistics
 import sys
-import time
-import urllib.request
 from pathlib import Path
 
-os.environ.setdefault("HF_HOME", r"D:\dsh-ai\lora\hf")
-if os.environ.get("HF_MIRROR", "1") == "1":
-    os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-
-ROOT = Path(r"E:\DSH\bili-corpus")
+ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from pipeline.llm import GEN_SYSTEM, GEN_USER  # noqa: E402  只读引用，不改动
+EMOJI_RE = re.compile(r"\[[^\[\]]{1,12}\]")
+NUM_RE = re.compile(r"\d+(?:\.\d+)?%?")
+LATIN_RE = re.compile(r"[A-Za-z]{2,}")
+
+# 纯虚词组合的 bigram 不算「内容」
+STOP_CHARS = set("的了是在和有不这那也就都还你我他她它大小上下很太就都没个么什怎因为所以但是如果"
+                 "而且然后可以可能应该已经现在时候什么怎么这样那样一些一下这个那个")
+
+MIN_SAMPLES = 30
+
+# 标点归一化：评测时剥掉标点和表情，只剩选词和句法。
+# 理由：检测器在原始文本上 AUC 0.956，但「只换标点加表情」的朴素基线
+# 就能拿到比真人还低的分数——说明标点贡献了可被作弊的分辨力。
+# 剥掉之后 AUC 仍有 0.707，剩下的才是真信号。
+_EMOJI_MARK_RE = re.compile(r"\[[^\[\]]{1,12}\]")          # [笑哭] [doge] 这类表情标记
+_KEEP_RE = re.compile(r"[^\u4e00-\u9fff0-9A-Za-z]")        # 只留汉字/数字/字母
 
 
-_SCORER = None
+def normalize_punct(text: str) -> str:
+    """剥掉标点、空白和表情标记，只留内容字。"""
+    return _KEEP_RE.sub("", _EMOJI_MARK_RE.sub("", text))
 
 
-def _scorer():
-    global _SCORER
-    if _SCORER is None:
-        from pipeline.rewrite import get_scorer
-        _SCORER = get_scorer()
-    return _SCORER
-
-
-def project_instruction(src: str) -> str:
-    """复现 rewrite.py 第 1 轮的指令拼装（只读调用，不修改项目代码）。
-
-    rewrite.py 里是 sc = get_scorer()，然后 orig_score = sc.describe(text)。
-    """
-    from pipeline.rewrite import build_instruction, describe_problems
-    d = _scorer().describe(src)
-    p = describe_problems(d)
-    return build_instruction(1, src, described=d, problems=p)
-
-
-def build_messages(src: str, n: int = 1) -> list[dict]:
-    ins = project_instruction(src)
-    user = GEN_USER.format(original=src, instruction=ins, n=n)
-    return [{"role": "system", "content": GEN_SYSTEM},
-            {"role": "user", "content": user}]
-
-
-def clean_out(text: str) -> str:
-    """去掉模型可能加的行号/引号/前后缀。"""
-    t = (text or "").strip()
-    for pre in ("改写：", "改写:", "输出：", "输出:"):
-        if t.startswith(pre):
-            t = t[len(pre):].strip()
-    t = t.strip().strip('"').strip("“”").strip()
-    # 去行首序号 "1. " / "10. " / "1、" / "1) "。
-    # `[.)]` 后面必须跟空白，否则「1.5倍速看完的」会被啃成「5倍速看完的」。
-    t = re.sub(r"^\d{1,2}(?:[.)]\s+|、\s*)", "", t)
-    return t.strip()
-
-
-def parse_multi(raw: str) -> list[str]:
-    """从「要求一次吐 n 个版本」的输出里切出候选。
-
-    只按行切 —— 这是最保守的口径：如果模型把 3 个版本写成一段，
-    这里就只能切出 1 条，那正好说明它不满足 pipeline 的多输出要求。
-    """
-    out = []
-    for line in (raw or "").splitlines():
-        c = clean_out(line)
-        if not c:
+# ------------------------------------------------------------------ 特征
+def key_terms(text: str) -> set[str]:
+    """抽「可核查的具体信息」：数字、英文词、内容 bigram。"""
+    terms: set[str] = set()
+    for m in NUM_RE.findall(text):
+        if len(m) >= 1:
+            terms.add(m)
+    for m in LATIN_RE.findall(text):
+        terms.add(m.lower())
+    cjk = re.sub(r"[^\u4e00-\u9fff]", "", text)
+    for i in range(len(cjk) - 1):
+        bg = cjk[i:i + 2]
+        if all(ch in STOP_CHARS for ch in bg):
             continue
-        # 去掉 markdown 列表符号
-        if c.startswith("- ") or c.startswith("* "):
-            c = c[2:].strip()
-        if c:
-            out.append(c)
-    # 去掉完全重复的
-    uniq = []
-    for c in out:
-        if c not in uniq:
-            uniq.append(c)
-    return uniq
+        terms.add(bg)
+    return terms
 
 
-# ---------------------------------------------------------------- Ollama
-
-def ollama_chat(model: str, messages: list[dict], temperature: float) -> str:
-    # Ollama 同样占显存（qwen3:8b Q4 权重 5.2GB + KV cache），一样要授权
-    if os.environ.get("DEAI_ALLOW_GPU") != "1":
-        raise SystemExit(
-            "[refuse] 未设置 DEAI_ALLOW_GPU=1，拒绝调用 Ollama（会占显存）。")
-    body = json.dumps({
-        "model": model,
-        "messages": messages,
-        "stream": False,
-        "think": False,
-        "options": {"temperature": temperature, "num_predict": 400},
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        "http://127.0.0.1:11434/api/chat", data=body,
-        headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=300) as r:
-        d = json.loads(r.read().decode("utf-8"))
-    return (d.get("message") or {}).get("content", "")
+def recall_of(src_terms: set[str], out_text: str) -> float:
+    if not src_terms:
+        return 1.0
+    out_terms = key_terms(out_text)
+    hit = sum(1 for t in src_terms if t in out_terms)
+    return hit / len(src_terms)
 
 
-# ---------------------------------------------------------------- HF 本地
+def dup_ratio(texts: list[str], prefix: int = 6) -> float:
+    """骨架重复：前 N 字相同的比例。"""
+    if len(texts) < 2:
+        return 0.0
+    keys = [t[:prefix] for t in texts]
+    uniq = len(set(keys))
+    return 1 - uniq / len(keys)
 
-def load_hf(model_name: str, adapter: str | None, four_bit: bool = True):
-    # 🔒 物理门禁：真要加载模型了才检查（--dry-run 不走这里，所以能离线验证）
-    if os.environ.get("DEAI_ALLOW_GPU") != "1":
-        raise SystemExit(
-            "[refuse] 未设置 DEAI_ALLOW_GPU=1，拒绝加载模型。\n"
-            "         离线验证请用 --dry-run（不加载模型）。\n"
-            "         确认可以用 GPU 后再：$env:DEAI_ALLOW_GPU='1'")
+
+# ------------------------------------------------------------------ 朴素基线
+NAIVE_EMO = ["[笑哭]", "[doge]", "[星星眼]", "[吃瓜]"]
+
+
+def naive_de_fish(text: str, idx: int = 0, emoji_rate: float = 1.0) -> str:
+    """朴素基线：只做「换标点 + 加表情」，一个字都不改。
+
+    为什么要这个基线：鱼腥味检测器主要靠句号认人（`。` 权重 +3.66）。
+    如果模型只比这条基线好一点点，说明它学的不是「像人」，是「像标点」。
+
+    这是**合格线**：跑不过它，等于没训。
+    """
+    t = text.replace("。", "，").replace("、", "，")
+    t = re.sub(r"\s+", "", t)                 # 鱼腔特有的数字后空格
+    t = t.rstrip("，, ")
+    if (idx % 100) >= int(emoji_rate * 100):
+        return t
+    return t + NAIVE_EMO[idx % len(NAIVE_EMO)]
+
+
+# ------------------------------------------------------------------ 鱼腥味检测器
+def fit_fish_detector(xs: list[str], ys: list[str]):
+    import numpy as np
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import make_pipeline
+
+    texts = xs + ys
+    lab = np.array([1] * len(xs) + [0] * len(ys))
+    clf = make_pipeline(
+        TfidfVectorizer(analyzer="char", ngram_range=(1, 3), min_df=1, sublinear_tf=True),
+        LogisticRegression(C=0.3, max_iter=3000, class_weight="balanced"),
+    )
+    clf.fit(texts, lab)
+    return clf
+
+
+# ------------------------------------------------------------------ 加载
+def load_predictions(path: Path) -> list[dict]:
+    rows = []
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not all(k in r for k in ("x", "y", "pred")):
+                continue
+            rows.append(r)
+    return rows
+
+
+def generate_with_adapter(adapter: Path, data: Path, max_new: int, temp: float) -> list[dict]:
+    """加载 adapter 逐条生成。占 GPU，需外部确认。"""
+    import os
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-    tok = AutoTokenizer.from_pretrained(model_name)
-    if tok.pad_token_id is None:
-        tok.pad_token = tok.eos_token
-    kwargs = {"device_map": {"": 0}, "torch_dtype": torch.bfloat16}
-    if four_bit:
-        kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True, bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=torch.bfloat16)
-    model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
-    if adapter:
-        from peft import PeftModel
-        model = PeftModel.from_pretrained(model, adapter)
-    model.eval()
-    return tok, model
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    # 和 webdemo 一样：不依赖调用者的 shell 环境，自己找模型缓存
+    for cand in (Path(r"D:\dsh-ai\lora\hf"), Path.home() / ".cache" / "huggingface"):
+        hub = cand / "hub"
+        try:
+            if hub.is_dir() and any(hub.glob("models--Qwen*")):
+                os.environ.setdefault("HF_HOME", str(cand))
+                break
+        except OSError:
+            continue
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+    MODEL = "Qwen/Qwen3-1.7B"
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.float16,
+                                                device_map="auto")
+    model = PeftModel.from_pretrained(model, str(adapter)).eval()
+
+    rows = []
+    with data.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            s = json.loads(line)
+            msgs = s["messages"]
+            prompt_msgs = msgs[:-1]
+            target = msgs[-1]["content"]
+            # 干净的原评论：内容保留指标只能拿它算。
+            # 不能拿 prompt_msgs[-1]，B 变体里混了 200 字视频摘要，
+            # 会把「输出没复述摘要」误判成「内容丢了」。
+            meta = s.get("_meta") or {}
+            clean_x = meta.get("x") or prompt_msgs[-1]["content"]
+            text = tok.apply_chat_template(prompt_msgs, tokenize=False,
+                                           add_generation_prompt=True, enable_thinking=False)
+            ids = tok(text, return_tensors="pt").to(model.device)
+            with torch.no_grad():
+                out = model.generate(**ids, max_new_tokens=max_new, do_sample=True,
+                                     temperature=temp, top_p=0.95,
+                                     pad_token_id=tok.eos_token_id)
+            pred = tok.decode(out[0][ids["input_ids"].shape[1]:],
+                              skip_special_tokens=True).strip().replace("\n", " ")
+            rows.append({
+                "bvid": meta.get("bvid", ""),
+                "x": clean_x,
+                "y": target,
+                "pred": pred,
+                "prompt_chars": sum(len(m["content"]) for m in prompt_msgs),
+            })
+    return rows
 
 
-def hf_generate(tok, model, messages, temperature=0.9, max_new_tokens=256) -> str:
-    import torch
-    text = tok.apply_chat_template(messages, tokenize=False,
-                                   add_generation_prompt=True,
-                                   enable_thinking=False)
-    enc = tok(text, return_tensors="pt").to(model.device)
-    with torch.no_grad():
-        out = model.generate(
-            **enc, max_new_tokens=max_new_tokens, do_sample=True,
-            temperature=temperature, top_p=0.9, repetition_penalty=1.05,
-            pad_token_id=tok.pad_token_id)
-    new = out[0][enc["input_ids"].shape[1]:]
-    return tok.decode(new, skip_special_tokens=True)
-
-
-# ---------------------------------------------------------------- 主流程
-
-def load_samples() -> list[dict]:
-    d = json.loads((ROOT / "state" / "rewrite_abc.json").read_text(encoding="utf-8"))
-    items = d["items"]
-    want = [0, 3]
-    out = []
-    for i in want:
-        it = items[i]
-        out.append({"id": it.get("id", str(i)), "index": i, "src": it["src"],
-                    "label": "短评" if i == 0 else "长评"})
-    return out
-
-
-def main() -> None:
+# ------------------------------------------------------------------ 报告
+def main() -> int:
+    sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tag", required=True, help="base / lora / qwen3-8b 之类")
-    ap.add_argument("--model", default="Qwen/Qwen3-1.7B")
-    ap.add_argument("--adapter", default=None)
-    ap.add_argument("--ollama", default=None, help="给定时走 Ollama")
-    ap.add_argument("--n", type=int, default=3)
-    ap.add_argument("--temperature", type=float, default=0.9)
-    ap.add_argument("--outdir", default=r"D:\dsh-ai\lora\out\eval")
-    ap.add_argument("--label", default=None,
-                    help="报告里显示的名字，如 '原始 1.7B' / '训后 1.7B'")
-    ap.add_argument("--with-n3", action="store_true",
-                    help="额外跑一次 n=3 的「多输出合规性」检查（不计入质量对比）")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="不加载任何模型，只验证 prompt 拼装和落盘（不碰 GPU）")
+    ap.add_argument("--predictions", type=Path, help="预测结果 jsonl")
+    ap.add_argument("--adapter", type=Path, help="LoRA adapter 目录（需 GPU）")
+    ap.add_argument("--data", type=Path, help="dev 数据 jsonl（配 --adapter）")
+    ap.add_argument("--triggers", type=Path,
+                    default=ROOT / "data" / "rewrite" / "b_train.jsonl",
+                    help="用来训鱼腥味检测器的训练集")
+    ap.add_argument("--max-new", type=int, default=96)
+    ap.add_argument("--temp", type=float, default=1.0)
+    ap.add_argument("--show", type=int, default=6, help="打印几条对照")
+    ap.add_argument("--normalize", action="store_true",
+                    help="剥掉标点和表情再判断，防止「换标点」作弊")
+    ap.add_argument("--save-preds", type=Path, default=None,
+                    help="把预测结果存成 jsonl，下次可直接 --predictions 复用")
     a = ap.parse_args()
-    display = a.label or a.tag
 
-    outdir = Path(a.outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
+    print("=" * 70)
+    print("  改写效果评测")
+    print("=" * 70)
 
-    samples = load_samples()
-    env_info = {"torch": None, "gpu": None, "capability": None}
+    # 鱼腥味检测器：优先用训练集里的 (x, y) 对
+    det = None
+    if a.triggers.exists():
+        xs, ys = [], []
+        with a.triggers.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                s = json.loads(line)
+                m = s["messages"]
+                # 从 user 里抠出「这条评论：xxx」不方便，直接用内容字段
+                xs.append(m[-2]["content"])
+                ys.append(m[-1]["content"])
+        if a.normalize:
+            xs = [normalize_punct(t) for t in xs]
+            ys = [normalize_punct(t) for t in ys]
+        if len(xs) >= 20:
+            det = fit_fish_detector(xs, ys)
+            print(f"  鱼腥味检测器：用 {len(xs)} 对训练样本拟合"
+                  + ("（已剥标点和表情）" if a.normalize else ""))
+    if det is None:
+        print("  ⚠️ 没有训练集可拟合鱼腥味检测器，跳过该指标")
+
+    if a.predictions:
+        rows = load_predictions(a.predictions)
+    elif a.adapter and a.data:
+        rows = generate_with_adapter(a.adapter, a.data, a.max_new, a.temp)
+    else:
+        print("  ❌ 需要 --predictions，或 --adapter + --data")
+        return 2
+
+    if a.save_preds:
+        a.save_preds.parent.mkdir(parents=True, exist_ok=True)
+        with a.save_preds.open("w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps({k: r[k] for k in ("bvid", "x", "y", "pred")},
+                                   ensure_ascii=False) + "\n")
+        print(f"  预测已存：{a.save_preds}")
+
+    if len(rows) < MIN_SAMPLES:
+        print()
+        print(f"  ❌ 样本只有 {len(rows)} 条，少于 {MIN_SAMPLES}，拒绝出指标")
+        return 2
+
+    preds = [r["pred"] for r in rows]
+    xs = [r["x"] for r in rows]
+    ys = [r["y"] for r in rows]
+
+    # ---- 鱼腥味
+    print()
+    print("【一】鱼腥味（越低越不像大肥鱼）")
+    if det is not None:
+        import numpy as np
+        # x 是 user 段（含模板文字），用它当「改造前的上界」参考
+        if a.normalize:
+            xs = [normalize_punct(t) for t in xs]
+            preds = [normalize_punct(t) for t in preds]
+            ys = [normalize_punct(t) for t in ys]
+        fish_x = det.predict_proba(xs)[:, 1]
+        fish_p = det.predict_proba(preds)[:, 1]
+        fish_y = det.predict_proba(ys)[:, 1]
+        # 朴素基线两档：强档（每条都加表情）和匹配档（只有 26% 加，和真人一致）
+        base_strong = [naive_de_fish(r["x"], i, 1.0) for i, r in enumerate(rows)]
+        base_match = [naive_de_fish(r["x"], i, 0.26) for i, r in enumerate(rows)]
+        fish_bs = det.predict_proba(base_strong)[:, 1]
+        fish_bm = det.predict_proba(base_match)[:, 1]
+        base_preds = base_strong
+        fish_b = fish_bm
+        print(f"    改造前（输入）   均值 {fish_x.mean():.3f}")
+        print(f"    模型输出         均值 {fish_p.mean():.3f}   "
+              f"中位 {statistics.median(fish_p):.3f}")
+        print(f"    真人目标（下限） 均值 {fish_y.mean():.3f}")
+        print(f"    基线·强（每条加表情）  均值 {fish_bs.mean():.3f}")
+        print(f"    基线·匹配（26% 加表情） 均值 {fish_bm.mean():.3f}")
+        drop = fish_x.mean() - fish_p.mean()
+        span = max(1e-6, fish_x.mean() - fish_y.mean())
+        bdrop_s = fish_x.mean() - fish_bs.mean()
+        bdrop_m = fish_x.mean() - fish_bm.mean()
+        print(f"    → 模型降幅 {drop:+.3f}，走完理想距离的 {drop / span * 100:.0f}%")
+        print(f"    → 强基线降幅 {bdrop_s:+.3f}（{bdrop_s / span * 100:.0f}%）"
+              f"  匹配基线 {bdrop_m:+.3f}（{bdrop_m / span * 100:.0f}%）")
+        if fish_bs.mean() < fish_y.mean():
+            print("    ⚠️ 只换标点加表情就能低于真人目标——**这个检测器可以被标点欺骗**，")
+            print("       所以它不能单独作为「成功」的依据。必须同时看内容保留和形态。")
+        if drop < bdrop_m * 0.8:
+            print("    ❌ 模型明显弱于匹配基线，改善可能只来自表层特征")
+        elif drop < bdrop_m:
+            print("    ⚠️ 模型略低于匹配基线，改善的可信度不足")
+        else:
+            print("    ✅ 模型不低于匹配基线")
+    else:
+        print("    （跳过）")
+        base_preds = []
+
+    # ---- 内容保留
+    print()
+    print("【二】内容保留（输入里的具体信息还剩多少）")
+    rec_x, rec_y = [], []
+    for r in rows:
+        terms = key_terms(r["x"])
+        rec_x.append(recall_of(terms, r["pred"]))
+        rec_y.append(recall_of(terms, r["y"]))
+    print(f"    模型输出  均值 {statistics.mean(rec_x):.3f}  "
+          f"中位 {statistics.median(rec_x):.3f}")
+    print(f"    真人目标  均值 {statistics.mean(rec_y):.3f}  "
+          f"（这是「改对了」该有的水平）")
+    lost = sum(1 for v in rec_x if v < 0.5)
+    print(f"    丢失过半的样本   {lost}/{len(rows)}（{lost/len(rows)*100:.0f}%）")
+
+    # ---- P(AI)
+    print()
+    print("【三】P(AI)（现有分类器，防掉回通用 AI 腔）")
     try:
-        import torch
-        env_info["torch"] = torch.__version__
-        if torch.cuda.is_available():
-            env_info["gpu"] = torch.cuda.get_device_name(0)
-            env_info["capability"] = list(torch.cuda.get_device_capability(0))
-    except Exception:
-        pass
+        from pipeline.scorer import Scorer
+        sc = Scorer()
+        pa = [sc.describe(t)["ai_prob"] for t in preds]
+        py = [sc.describe(t)["ai_prob"] for t in ys]
+        print(f"    模型输出  均值 {statistics.mean(pa):.3f}  "
+              f"中位 {statistics.median(pa):.3f}")
+        print(f"    真人目标  均值 {statistics.mean(py):.3f}")
+        hi = sum(1 for v in pa if v >= 0.5)
+        print(f"    判成 AI 的   {hi}/{len(rows)}（{hi/len(rows)*100:.0f}%）")
+    except Exception as e:
+        print(f"    （分类器不可用：{type(e).__name__}）")
 
-    results = {
-        "tag": a.tag,
-        "label": display,              # 报告里显示的名字
-        "model": a.model,
-        "adapter": a.adapter,
-        "ollama": a.ollama,
-        "temperature": a.temperature,
-        "n": a.n,
-        "sampling": "independent n=1 x3",   # 主口径：独立采样
-        "with_n3": a.with_n3,
-        "env": env_info,
-        "items": [],
-    }
+    # ---- 形态
+    print()
+    print("【四】形态")
+    for name, arr in (("模型输出", preds), ("真人目标", ys)):
+        lens = [len(t) for t in arr]
+        emo = sum(1 for t in arr if EMOJI_RE.search(t)) / len(arr) * 100
+        print(f"    {name}  中位 {statistics.median(lens):.0f} 字  "
+              f"<10字 {sum(1 for l in lens if l < 10)/len(lens)*100:.0f}%  "
+              f"表情 {emo:.0f}%  骨架重复 {dup_ratio(arr)*100:.1f}%")
 
-    tok = model = None
-    if not a.dry_run and not a.ollama:
-        tok, model = load_hf(a.model, a.adapter)
+    # ---- 抽样对照
+    if a.show:
+        print()
+        print("【五】抽样对照")
+        for r in rows[:a.show]:
+            print(f"    输入  {r['x'][:60]}")
+            print(f"    输出  {r['pred'][:60]}")
+            print(f"    真人  {r['y'][:60]}")
+            print()
 
-    def gen(msgs: list[dict], dry: str) -> str:
-        if a.dry_run:
-            return dry
-        if a.ollama:
-            return ollama_chat(a.ollama, msgs, a.temperature)
-        return hf_generate(tok, model, msgs, a.temperature)
-
-    t_all = time.time()
-    for s in samples:
-        msgs = build_messages(s["src"], n=1)
-        cands = []
-        for k in range(a.n):
-            t0 = time.time()
-            raw = gen(msgs, f"[DRY-RUN candidate {k}]")
-            cands.append({"k": k, "raw": raw, "text": clean_out(raw),
-                          "sec": round(time.time() - t0, 1)})
-            print(f"[{a.tag}] item{s['index']} cand{k}: {clean_out(raw)[:70]}",
-                  flush=True)
-
-        item = {
-            "index": s["index"], "id": s["id"], "label": s["label"],
-            "src": s["src"],
-            "instruction": project_instruction(s["src"]),
-            "candidates": cands,
-        }
-
-        # ---- 附加：一次请求 n=3 的「多输出合规性」（工程可用性，不计入质量分）
-        if a.with_n3:
-            msgs3 = build_messages(s["src"], n=3)
-            raw3 = gen(msgs3, "[DRY-RUN n3] a\n[DRY-RUN n3] b\n[DRY-RUN n3] c")
-            parsed = parse_multi(raw3)
-            item["n3"] = {
-                "requested": 3,
-                "raw": raw3,
-                "parsed": parsed,
-                "distinct_count": len(parsed),
-                # 能不能按 pipeline 的用法吐出 3 个独立候选
-                "compliant": len(parsed) >= 3,
-                "note": "退化成 1 段或多段粘连" if len(parsed) < 3 else "",
-            }
-            print(f"[{a.tag}] item{s['index']} n3 -> {len(parsed)} 条 "
-                  f"compliant={len(parsed) >= 3}", flush=True)
-
-        results["items"].append(item)
-
-    results["elapsed_sec"] = round(time.time() - t_all, 1)
-    results["peak_vram_mib"] = None
-    try:
-        import torch
-        if torch.cuda.is_available():
-            results["peak_vram_mib"] = round(
-                torch.cuda.max_memory_allocated() / 1024 ** 2, 1)
-    except Exception:
-        pass
-
-    p = outdir / f"{a.tag}.json"
-    p.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"[saved] {p}", flush=True)
+    print("  ⚠️ 提醒：只看「鱼腥味下降」会被「写得更短更空」骗到，")
+    print("          必须同时看内容保留。两者要一起改善才算真的成功。")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -70,6 +70,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--grad-accum", type=int, default=8)
     ap.add_argument("--lora-r", type=int, default=16)
     ap.add_argument("--lora-alpha", type=int, default=32)
+    ap.add_argument("--lora-targets", default="attn",
+                    choices=["attn", "attn_mlp", "all_linear"],
+                    help="挂 LoRA 的层：attn=只挂注意力（旧默认）；"
+                         "attn_mlp=加 gate/up/down，风格迁移收益大；"
+                         "all_linear=再加 lm_head/embed_tokens")
     ap.add_argument("--lora-dropout", type=float, default=0.05)
     ap.add_argument("--warmup-ratio", type=float, default=0.03)
     ap.add_argument("--seed", type=int, default=42)
@@ -167,6 +172,19 @@ def build_collator(tokenizer, max_len: int):
     return collate
 
 
+# 挂 LoRA 的层。
+# 旧配置只有注意力层，但它管的是「抽什么信息」，不管「怎么措辞」。
+# 风格改写真正要动的是 MLP（gate/up/down）——措辞和句式的落脚点在那里。
+LORA_TARGET_MAP = {
+    "attn": ["q_proj", "k_proj", "v_proj", "o_proj"],
+    "attn_mlp": ["q_proj", "k_proj", "v_proj", "o_proj",
+                 "gate_proj", "up_proj", "down_proj"],
+    "all_linear": ["q_proj", "k_proj", "v_proj", "o_proj",
+                   "gate_proj", "up_proj", "down_proj",
+                   "lm_head", "embed_tokens"],
+}
+
+
 def main() -> None:
     args = parse_args()
     out = Path(args.out)
@@ -227,7 +245,7 @@ def main() -> None:
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         bias="none",
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        target_modules=LORA_TARGET_MAP[args.lora_targets],
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora)
@@ -329,7 +347,7 @@ def main() -> None:
         "lr": args.lr,
         "lora": {"r": args.lora_r, "alpha": args.lora_alpha,
                  "dropout": args.lora_dropout,
-                 "targets": ["q_proj", "k_proj", "v_proj", "o_proj"]},
+                 "targets": LORA_TARGET_MAP[args.lora_targets]},
         "trainable_params": trainable,
         "steps": int(result.global_step) if hasattr(result, "global_step") else None,
         "train_loss": getattr(result, "training_loss", None),

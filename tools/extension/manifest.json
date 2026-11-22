@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "B站评论 AI 味检测",
+  "version": "0.1.0",
+  "description": "给 B站 视频页的评论打分（通用 AI 腔 + 鱼腥味），高分评论可一键改写成人话。",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "http://127.0.0.1:8849/*",
+    "https://www.bilibili.com/*",
+    "https://api.bilibili.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.bilibili.com/video/*",
+        "https://www.bilibili.com/list/*",
+        "https://www.bilibili.com/bangumi/play/*"
+      ],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "action": {
+    "default_title": "B站评论 AI 味检测"
+  }
+}
