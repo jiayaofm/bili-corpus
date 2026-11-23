@@ -328,9 +328,15 @@ class Rewriter:
     #   4 选 1          0.534 (+14.2%)  ← 主力
     #   4 选 1 + 压逗号  0.543 (+16.1%)  ← 最佳
     # 压逗号只在重排之上才有意义，因为重排能把「压过头」的候选筛掉。
-    N_CAND = 4
+    # 候选数的性价比（dev 78 条实测，综合分 = 0.6×语法 + 0.4×内容）：
+    #   基线      0.468
+    #   2 选 1    0.508 (+7.4%)   耗时约单条的 2 倍
+    #   3 选 1    0.534 (+10.8%)  内容保留已追平 4 选 1
+    #   4 选 1    0.534 (+14.2%)  只多赚语法分
+    # 默认取 2；想要更好质量用 --cand 3 或 4。
+    N_CAND = 2
     # 压逗号在离线实验里只多 1.9 个点（0.534→0.543），实测却会把逗号换成空格、
-    # 还诱发了重复退化（点歪歪点歪歪）。收益太小、副作用太明显，关掉。
+    # 还诱发了重复退化（点歪歪点歪歪）。收益太小、副作用太明显，默认关掉。
     COMMA_BIAS = 0.0
 
     @classmethod
@@ -352,6 +358,9 @@ class Rewriter:
     # 注意：材、本、東这类繁简同形的字不能放进来。第一版误收了「材」，
     # 导致「材料学卡住了」这种正常输出被当成繁体丢掉。
 
+    # 中文评论不会以这些字收尾，出现了基本就是被 token 上限切断的。
+    TRUNC_TAIL = set("的是在把被和但而因所如虽就都也还很太更最与及或")
+
     def _cand_ok(self, src: str, cand: str) -> bool:
         """硬过滤：语言一致、没被截断、够长。"""
         if not cand or len(cand) < 6:
@@ -363,13 +372,19 @@ class Rewriter:
             return False
         # 中文之间夹空格当逗号用（实测「材料学卡了 材料一突破了」）。
         # 真人不这么写，但语法分统计不到，只能硬挡。
-        if len(re.findall(r"[\u4e00-\u9fff]\s+[\u4e00-\u9fff]", cand)) >= 2:
+        # 阈值从 2 降到 1：只出现一处的也见过（「都是说法 你现在是…」）。
+        if re.search(r"[\u4e00-\u9fff][ \t]{1,}[\u4e00-\u9fff]", cand):
             return False
         # 整句被方括号包住
         if cand.startswith("[") and cand.endswith("]"):
             return False
         # 结尾挂着一个只有左括号或光秃秃的标点
         if cand[-1] in "[（(【":
+            return False
+        # 结尾落在这些字上，几乎一定是被切断的：
+        # 实测「…11块的菜卖111，当场」「…他手里却是拿木棍，但」
+        # 数字也要算：出现过「…11块钱的菜卖1」这种半截价格。
+        if cand[-1] in self.TRUNC_TAIL or cand[-1].isdigit():
             return False
         return True
 
@@ -683,6 +698,8 @@ def main() -> int:
     sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8849)
+    ap.add_argument("--cand", type=int, default=2,
+                    help="改写时生成几条候选再重排：1=不重排，2~4 越大越慢但越好")
     ap.add_argument("--lora", action="store_true", help="同时加载改写模型（占显存）")
     ap.add_argument("--adapter", default=str(Path(r"D:\dsh-ai\lora\out\fish-a2")))
     a = ap.parse_args()
@@ -705,6 +722,10 @@ def main() -> int:
 
     FISH = FishDetector()
     REWRITER = Rewriter(a.adapter if a.lora else None)
+    REWRITER.N_CAND = max(1, a.cand)
+    if REWRITER.N_CAND > 1:
+        print(f"  [rewrite] 每条生成 {REWRITER.N_CAND} 个候选再挑一个"
+              f"（耗时约为单条的 {REWRITER.N_CAND} 倍）", flush=True)
 
     if a.lora:
         if not REWRITER.load():
