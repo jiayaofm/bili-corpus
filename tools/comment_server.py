@@ -62,6 +62,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -316,7 +317,81 @@ class Rewriter:
         原来固定 64，长评论会被硬截断——实测 71 字的输入，输出停在
         「科学家一看到外星人飞船就明白，」这种半句上，内容直接丢了。
         """
-        return min(200, max(64, int(max(len(t) for t in texts) * 1.6) + 40))
+        # 系数从 1.6 提到 2.2：改写常比原文长，1.6 倍时输出会断在半句
+        # （实测「…11块的菜卖111块，老唐」就断在这）
+        return min(260, max(80, int(max(len(t) for t in texts) * 2.2) + 60))
+
+    # --- 候选重排 + 逗号抑制 ---------------------------------------------
+    # 实测（dev 78 条，综合分 = 0.6×语法像人话 + 0.4×内容保留）：
+    #   基线            0.468
+    #   只压逗号        0.443 (-5.3%)   ← 单独做没用，逗号压下去句号涨上来
+    #   4 选 1          0.534 (+14.2%)  ← 主力
+    #   4 选 1 + 压逗号  0.543 (+16.1%)  ← 最佳
+    # 压逗号只在重排之上才有意义，因为重排能把「压过头」的候选筛掉。
+    N_CAND = 4
+    # 压逗号在离线实验里只多 1.9 个点（0.534→0.543），实测却会把逗号换成空格、
+    # 还诱发了重复退化（点歪歪点歪歪）。收益太小、副作用太明显，关掉。
+    COMMA_BIAS = 0.0
+
+    @classmethod
+    def _demote_proc(cls, ids, bias):
+        """把逗号类 token 的 logit 压低。sisyphus 生成时逐 token 调用。"""
+
+        def proc(input_ids, scores):
+            for i in ids:
+                scores[:, i] = scores[:, i] - bias
+            return scores
+
+        return proc
+
+    # 常见繁体专用字。模型偶尔会整条输出繁体（实测「點歪不點歪都是說法」），
+    # 而语法分只看统计量，发现不了这种问题，所以单独挡。
+    _TRAD = set(
+        "點說學現發財後機麼還沒這個們來時會為與對開關頓過真無錯體樣種動"
+        "聲氣東邊連遠運進選雖讓訴識讀變車馬鳥魚幾點嗎話語見覺得")
+    # 注意：材、本、東这类繁简同形的字不能放进来。第一版误收了「材」，
+    # 导致「材料学卡住了」这种正常输出被当成繁体丢掉。
+
+    def _cand_ok(self, src: str, cand: str) -> bool:
+        """硬过滤：语言一致、没被截断、够长。"""
+        if not cand or len(cand) < 6:
+            return False
+        if any(ch in self._TRAD for ch in cand):
+            return False
+        # 表情标签被切一半：[打cal
+        if cand.count("[") > cand.count("]"):
+            return False
+        # 中文之间夹空格当逗号用（实测「材料学卡了 材料一突破了」）。
+        # 真人不这么写，但语法分统计不到，只能硬挡。
+        if len(re.findall(r"[\u4e00-\u9fff]\s+[\u4e00-\u9fff]", cand)) >= 2:
+            return False
+        # 整句被方括号包住
+        if cand.startswith("[") and cand.endswith("]"):
+            return False
+        # 结尾挂着一个只有左括号或光秃秃的标点
+        if cand[-1] in "[（(【":
+            return False
+        return True
+
+    def _rep_penalty(self, s: str) -> float:
+        """重复退化惩罚。实测重排会挑出「点歪和点歪都是说法」这种病句。"""
+        from collections import Counter
+        bg = [s[i:i + 2] for i in range(len(s) - 1)]
+        bg = [b for b in bg if b.strip()]
+        if not bg:
+            return 0.0
+        c = Counter(bg)
+        return sum(max(0, v - 2) for v in c.values()) * 0.03
+
+    def _rank(self, src: str, cand: str) -> float:
+        """候选打分：语法像人话 + 内容保留 − 重复惩罚。"""
+        return (0.6 * human_score(cand)
+                + 0.4 * self._content_recall(src, cand)
+                - self._rep_penalty(cand))
+
+    def _content_recall(self, src: str, out: str) -> float:
+        A, B = self._bigrams(src), self._bigrams(out)
+        return 1.0 if not A else len(A & B) / len(A)
 
     def __init__(self, adapter: str | None) -> None:
         self.adapter = adapter
@@ -327,6 +402,7 @@ class Rewriter:
         self.q = __import__('queue').Queue()
         self.worker = None
         self.BATCH_MAX = 8
+        self.comma_ids = []
 
     def load(self) -> bool:
         if self.model is not None:
@@ -393,42 +469,43 @@ class Rewriter:
                 except _q.Empty:
                     break
             try:
+                self.tok.padding_side = "left"
+                # 每条请求生成 N_CAND 个候选，最后挑一个
                 prompts = []
                 for text, _, _ in batch:
                     msgs = [{"role": "system", "content": self.SYSTEM},
                             {"role": "user", "content": self.TMPL.format(x=text)}]
-                    prompts.append(self.tok.apply_chat_template(
+                    p = self.tok.apply_chat_template(
                         msgs, tokenize=False, add_generation_prompt=True,
-                        enable_thinking=False))
-                self.tok.padding_side = "left"
-                enc = self.tok(prompts, return_tensors="pt", padding=True).to(self.model.device)
+                        enable_thinking=False)
+                    prompts.extend([p] * self.N_CAND)
+
+                if not self.comma_ids:
+                    self.comma_ids = sorted(set(
+                        self.tok.encode("，", add_special_tokens=False)
+                        + self.tok.encode("、", add_special_tokens=False)
+                        + self.tok.encode("；", add_special_tokens=False)))
+                procs = ([self._demote_proc(self.comma_ids, self.COMMA_BIAS)]
+                         if self.COMMA_BIAS else None)
+
                 mn = self._max_new([t for t, _, _ in batch])
+                enc = self.tok(prompts, return_tensors="pt", padding=True).to(self.model.device)
                 with torch.inference_mode():
                     out = self.model.generate(**enc, max_new_tokens=mn, do_sample=True,
-                                              temperature=0.9, top_p=0.95,
+                                              temperature=0.95, top_p=0.95,
+                                              logits_processor=procs,
                                               pad_token_id=self.tok.eos_token_id)
                 gen = out[:, enc["input_ids"].shape[1]:]
-                texts = self.tok.batch_decode(gen, skip_special_tokens=True)
+                cands = [s.strip().replace("\n", " ") for s in
+                         self.tok.batch_decode(gen, skip_special_tokens=True)]
 
-                # 输出和输入几乎一样的那几条，升温重生成一次
-                retry = [i for i, ((txt, _, _), o) in enumerate(zip(batch, texts))
-                         if self._too_similar(txt, o)]
-                if retry:
-                    rp = [prompts[i] for i in retry]
-                    enc2 = self.tok(rp, return_tensors="pt",
-                                    padding=True).to(self.model.device)
-                    with torch.inference_mode():
-                        out2 = self.model.generate(
-                            **enc2, max_new_tokens=mn, do_sample=True,
-                            temperature=1.1, top_p=0.9,
-                            pad_token_id=self.tok.eos_token_id)
-                    gen2 = out2[:, enc2["input_ids"].shape[1]:]
-                    for i, s in zip(retry, self.tok.batch_decode(
-                            gen2, skip_special_tokens=True)):
-                        texts[i] = s
-
-                for (_, ev, box), t in zip(batch, texts):
-                    box["out"] = t.strip().replace("\n", " ")
+                for i, (txt, ev, box) in enumerate(batch):
+                    pool = cands[i * self.N_CAND:(i + 1) * self.N_CAND]
+                    # 先排除「几乎没改」的，再从剩下的里挑分最高的
+                    good = [c for c in pool
+                            if not self._too_similar(txt, c) and self._cand_ok(txt, c)]
+                    best = max(good or pool, key=lambda c: self._rank(txt, c))
+                    box["out"] = best
                     ev.set()
             except Exception as e:                    # noqa: BLE001
                 for _, ev, box in batch:
@@ -442,6 +519,15 @@ FISH = None
 REWRITER = None
 AI_REF: list[float] = []          # 真人评论的 AI 分分布，用来算百分位
 CLF3 = None                       # 新分类器（手工特征 + 句向量）
+
+
+try:
+    sys.path.insert(0, str(ROOT / "tools"))
+    from syntax_stats import human_score          # noqa: E402
+except Exception as _e:                            # noqa: BLE001
+    def human_score(_t):
+        return 0.0
+    print(f"  [syntax] 语法打分不可用：{_e}", flush=True)
 
 
 def load_ai_reference(n: int = 1500) -> None:
