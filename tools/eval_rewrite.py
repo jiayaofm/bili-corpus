@@ -370,7 +370,18 @@ def main() -> int:
     print(f"    真人目标  均值 {statistics.mean(rec_y):.3f}  "
           f"（这是「改对了」该有的水平）")
     lost = sum(1 for v in rec_x if v < 0.5)
-    print(f"    丢失过半的样本   {lost}/{len(rows)}（{lost/len(rows)*100:.0f}%）")
+    lost_y = sum(1 for v in rec_y if v < 0.5)
+    # 用真人的分布当参照，而不是拍一个 0.5 的绝对阈值。
+    # v4_dev 上真人原文自己有 66% 落在 0.5 以下（这批改写幅度本来就大），
+    # 用绝对阈值会把「正确的改写」也算成失败。
+    print(f"    真人目标里同样低于 0.5 的   {lost_y}/{len(rows)}"
+          f"（{lost_y/len(rows)*100:.0f}%）← 这是参照线")
+    print(f"    模型低于 0.5 的            {lost}/{len(rows)}"
+          f"（{lost/len(rows)*100:.0f}%）")
+    if lost <= lost_y * 1.3:
+        print("    → 与真人水平相当，不算丢信息")
+    else:
+        print("    → 明显多于真人，改写时丢了内容")
 
     # ---- P(AI)
     print()
