@@ -361,6 +361,127 @@ class Rewriter:
     # 中文评论不会以这些字收尾，出现了基本就是被 token 上限切断的。
     TRUNC_TAIL = set("的是在把被和但而因所如虽就都也还很太更最与及或")
 
+    # ---------------------------------------------------------------- 数字
+    # 实测「沙县 11 块的炒饭」会被改写成「沙县十一点的炒饭」，
+    # 「15分钟」→「五分钟」，「99%」→「九成」（99 变成 90）。带了数字的
+    # 样本里 25% 出错，而真人原文只有 6%。
+    _CN_DIGIT = "零一二三四五六七八九"
+    _CN_UNIT = ["", "十", "百", "千"]
+
+    @classmethod
+    def _to_cn(cls, n: int) -> str:
+        """0~9999 转中文数字（11→十一，110→一百一十）。"""
+        if n <= 0 or n > 9999:
+            return ""
+        s = str(n)
+        out = []
+        for i, ch in enumerate(s):
+            d = int(ch)
+            unit = cls._CN_UNIT[len(s) - i - 1]
+            if d == 0:
+                if out and out[-1] != "零" and i != len(s) - 1:
+                    out.append("零")
+                continue
+            if d == 1 and unit == "十" and i == 0:
+                out.append("十")
+            else:
+                out.append(cls._CN_DIGIT[d] + unit)
+        return "".join(out).rstrip("零")
+
+    # 数字后面跟的量词。只比数字不够：「11块 → 十一点」数字是对的，
+    # 但把价格变成了时间，必须连量词一起看。
+    _UNITS = ("块元角分年月日个只条次碗斤米秒点张件份套本台部杯包瓶袋双对成"
+              "遍回轮层位名岁周期集章页支场局盘球拍页")
+
+    @classmethod
+    def _restore_numbers(cls, src: str, out: str) -> str:
+        """把模型改坏的数字还原成源文的阿拉伯数字。
+
+        为什么不在解码期管：实测 1.7B 模型根本做不到——就算提示里明确写
+        「11 块必须保持 11 块」，它还是写出「十块」「一百一十」「十分钟」。
+        这些不只是写法不同，是**改值**（11→10，111→110，15→10）。
+
+        做法：按源文顺序取「数字+量词」，在输出里顺序找下一个
+        「数字（阿拉伯或中文）+同一量词」，替换成源文的数字。
+        某个找不到就跳过，不整体放弃——模型经常少写或多写几个数字。
+        """
+        items = []
+        for n, nxt in re.findall(r"(\d+)\s*(.)?", src):
+            unit = nxt if nxt and nxt in cls._UNITS else (
+                "%" if nxt == "%" else "")
+            items.append((n, unit))
+
+        cursor = 0
+        pieces = []
+        for num, unit in items:
+            if not unit:
+                continue
+            # 百分比在口语里常写成「九成」/「九成九」，两种都要认
+            alts = [unit] + (["成"] if unit == "%" else [])
+            hit, matched = None, None
+            for u in alts:
+                pat = re.compile(r"([0-9]+|[零〇一二三四五六七八九十百千两]+)"
+                                 r"(\s*)(" + re.escape(u) + r")")
+                m = pat.search(out, cursor)
+                if not m:
+                    continue
+                # 「九成九」是 99 的正确写法，别把前半截换掉
+                if u == "成" and m.end() < len(out) and \
+                        out[m.end()] in cls._CN_DIGIT + "两":
+                    continue
+                hit, matched = m, u
+                break
+            if not hit:
+                continue
+            # 命中「成」时还原成 %，否则会出现「99成的人」
+            rep_unit = "%" if matched == "成" else hit.group(3)
+            pieces.append(out[cursor:hit.start()])
+            pieces.append(num + hit.group(2) + rep_unit)
+            cursor = hit.end()
+        if not pieces:
+            return out
+        pieces.append(out[cursor:])
+        return "".join(pieces)
+
+    @classmethod
+    def _num_forms(cls, num: str, unit: str) -> list[str]:
+        """这个数字在这个量词下所有可接受写法。
+
+        **只接受阿拉伯数字写法。** 本来想放宽到等值汉字（真人会写「八碗」
+        「九成九」），但实测 1.7B 模型做数字→汉字转换不可靠：
+          11 块    → 十块      （11 变 10）
+          111 块   → 一百一十   （111 变 110）
+        放宽的收益（更自然）远小于风险（数字错），所以收死。
+        """
+        return [num + unit if unit else num]
+
+    @classmethod
+    def _nums_lost(cls, src: str, out: str) -> list[str]:
+        """输入里有、输出里被改值或丢掉的东西。
+
+        允许写成等值汉字（真人也会写「八碗」「九成九」），
+        但不允许变值、改量词（11块→11点）、或直接消失。
+        """
+        if not re.search(r"\d", src):
+            return []
+        lost = []
+        out_compact = re.sub(r"\s+", "", out)      # 「11 块」和「11块」都算
+        # 数字 + 后面紧跟的一个字符（量词或标点）。
+        # \s* 不能省：源文常写成「11 块」，中间带空格，否则量词会漏掉。
+        for num, nxt in re.findall(r"(\d+)\s*(.)?", src):
+            unit = nxt if nxt and nxt in cls._UNITS else (
+                "%" if nxt == "%" else "")
+            forms = cls._num_forms(num, unit)
+            if not any(f in out or f in out_compact for f in forms):
+                lost.append(num + (unit or ""))
+        # 去重保序
+        seen, uniq = set(), []
+        for x in lost:
+            if x not in seen:
+                seen.add(x)
+                uniq.append(x)
+        return uniq
+
     def _cand_ok(self, src: str, cand: str) -> bool:
         """硬过滤：语言一致、没被截断、够长。"""
         if not cand or len(cand) < 6:
@@ -386,6 +507,8 @@ class Rewriter:
         # 数字也要算：出现过「…11块钱的菜卖1」这种半截价格。
         if cand[-1] in self.TRUNC_TAIL or cand[-1].isdigit():
             return False
+        # 数字不在过滤阶段管：模型把 11 写成十、15 写成十是常态，
+        # 用这条否决会把好候选也杀掉。改在生成后由 _restore_numbers 修。
         return True
 
     def _rep_penalty(self, s: str) -> float:
@@ -514,13 +637,19 @@ class Rewriter:
                 cands = [s.strip().replace("\n", " ") for s in
                          self.tok.batch_decode(gen, skip_special_tokens=True)]
 
+                picks = {}
                 for i, (txt, ev, box) in enumerate(batch):
                     pool = cands[i * self.N_CAND:(i + 1) * self.N_CAND]
-                    # 先排除「几乎没改」的，再从剩下的里挑分最高的
+                    # 先排除「几乎没改」和各类不合格的，再挑分最高的
                     good = [c for c in pool
                             if not self._too_similar(txt, c) and self._cand_ok(txt, c)]
                     best = max(good or pool, key=lambda c: self._rank(txt, c))
-                    box["out"] = best
+                    # 数字最后统一还原：模型把 11 块写成十块、15 分钟写成
+                    # 十分钟这类改值错误，靠提示管不住，只能生成后改回来。
+                    picks[i] = self._restore_numbers(txt, best)
+
+                for i, (txt, ev, box) in enumerate(batch):
+                    box["out"] = picks[i]
                     ev.set()
             except Exception as e:                    # noqa: BLE001
                 for _, ev, box in batch:
