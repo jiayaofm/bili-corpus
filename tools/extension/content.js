@@ -387,8 +387,16 @@
         meta.textContent =
           d(r.ai_before_pct, r.ai_after_pct, 'AI') + '　' +
           d(r.fish_before, r.fish_after, '鱼');
+        // 服务端两次尝试都没能真正改掉（比如原句全是引用和 @ 提及），
+        // 如实告诉用户，别把几乎没变的句子当「已改写」展示。
+        if (r.weak) {
+          const warn = document.createElement('span');
+          warn.textContent = '　⚠ 这条没改到位';
+          warn.style.cssText = 'color:#c0392b';
+          meta.append(warn);
+        }
         holder.append(out, meta);
-        btn.textContent = '已改写';
+        btn.textContent = r.weak ? '改不动' : '已改写';
       } catch (e) {
         holder.textContent = '改写失败：' + (e.message || e);
         btn.disabled = false;

@@ -300,10 +300,14 @@ class Rewriter:
         t = self._CJK_RE.sub("", t)
         return {t[i:i + 2] for i in range(len(t) - 1)}
 
-    def _too_similar(self, a: str, b: str, thr: float = 0.85) -> bool:
+    def _too_similar(self, a: str, b: str, thr: float = 0.60) -> bool:
         """输出和输入几乎一样 → 判定为「没改」。
 
-        实测 dev 上有 1% 是一字不差，用户体感就是「点了没反应」。
+        阈值原来是 0.85，太松了。v4 训练数据里「输入 vs 真人目标」的
+        相似度中位是 0.29、P90 是 0.40，而 0.78、0.84 这种只换几个近义词的
+        输出能轻松通过 0.85 —— 实测用户拿到的就是这么两条：
+          「拼一块→黏一块」「想法→意思」           相似度 0.78
+          「只删掉句尾的『啊。』」                  相似度 0.84
         """
         A, B = self._bigrams(a), self._bigrams(b)
         if not (A | B):
@@ -352,14 +356,24 @@ class Rewriter:
 
     # 常见繁体专用字。模型偶尔会整条输出繁体（实测「點歪不點歪都是說法」），
     # 而语法分只看统计量，发现不了这种问题，所以单独挡。
+    #
+    # 只收「繁体独有」的字。繁简同形的字绝对不能进来，否则会大面积误杀：
+    #   第一版误收「材」→「材料学卡住了」被丢
+    #   第二版误收「得」→「笑得不行」「写得漂漂亮亮」全被丢（!!）
+    #   还误收过「真」「本」
+    # 简繁同形字举例：得 真 本 材 东 后? 注意「后/後」不算同形。
     _TRAD = set(
-        "點說學現發財後機麼還沒這個們來時會為與對開關頓過真無錯體樣種動"
-        "聲氣東邊連遠運進選雖讓訴識讀變車馬鳥魚幾點嗎話語見覺得")
-    # 注意：材、本、東这类繁简同形的字不能放进来。第一版误收了「材」，
-    # 导致「材料学卡住了」这种正常输出被当成繁体丢掉。
+        "點說學現發財機麼沒這個們來時會為與對開關頓過無錯體樣種動"
+        "聲氣邊連遠運進選雖讓訴識讀變車馬鳥魚幾嗎話語見覺還貴價錢")
+    # 明确排除（繁简同形，写在这里提醒后来人别再收进去）
+    _TRAD_SHARED = set("得真本材東")
 
     # 中文评论不会以这些字收尾，出现了基本就是被 token 上限切断的。
-    TRUNC_TAIL = set("的是在把被和但而因所如虽就都也还很太更最与及或")
+    # 只有这些字真正不可能出现在句末。
+    # 原来的表里收了「的、是、在、了、就、都、也、还、很、太、更、最」——
+    # 这些在中文评论里本来就是常见收尾（真人 74% 的评论结尾连标点都没有），
+    # 拿它们判截断会把合格候选误杀。
+    TRUNC_TAIL = set("把被但而因所如虽与及或况并")
 
     # ---------------------------------------------------------------- 数字
     # 实测「沙县 11 块的炒饭」会被改写成「沙县十一点的炒饭」，
@@ -505,7 +519,7 @@ class Rewriter:
         # 结尾落在这些字上，几乎一定是被切断的：
         # 实测「…11块的菜卖111，当场」「…他手里却是拿木棍，但」
         # 数字也要算：出现过「…11块钱的菜卖1」这种半截价格。
-        if cand[-1] in self.TRUNC_TAIL or cand[-1].isdigit():
+        if cand[-1] in self.TRUNC_TAIL:
             return False
         # 数字不在过滤阶段管：模型把 11 写成十、15 写成十是常态，
         # 用这条否决会把好候选也杀掉。改在生成后由 _restore_numbers 修。
@@ -568,12 +582,15 @@ class Rewriter:
             print(f"  [lora] 失败：{self.error}", flush=True)
             return False
 
-    def rewrite(self, text: str, timeout: float = 90.0) -> str | None:
+    def rewrite(self, text: str, timeout: float = 90.0) -> tuple[str, bool] | None:
         """把一个改写请求丢进队列，等批量工作线程回结果。
 
         为什么排队而不直接生成：模型一次只能跑一个，
         连点 5 个按钮时串行要 55 秒（实测），后面几个必然超时。
         合成一个 batch 一次生成，5 个大概和 1 个一样快。
+
+        返回 (改写结果, 是否没改到位)。第二个值用来让前端如实提示，
+        而不是把一条几乎没变的句子当成「已改写」展示。
         """
         if not self.load():
             return None
@@ -581,13 +598,13 @@ class Rewriter:
 
         self._ensure_worker()
         ev = threading.Event()
-        box = {"out": None, "err": None}
+        box = {"out": None, "err": None, "weak": False}
         self.q.put((text, ev, box))
         if not ev.wait(timeout):
             return None
         if box["err"]:
             raise RuntimeError(box["err"])
-        return box["out"]
+        return box["out"], bool(box.get("weak"))
 
     def _ensure_worker(self) -> None:
         if getattr(self, "worker", None) is not None:
@@ -634,22 +651,80 @@ class Rewriter:
                                               logits_processor=procs,
                                               pad_token_id=self.tok.eos_token_id)
                 gen = out[:, enc["input_ids"].shape[1]:]
+                eos = self.tok.eos_token_id
+                # 准确的截断信号：没以 EOS 结尾就是撞上了 max_new。
+                # 之前靠「结尾字黑名单」，把「了」「的」「是」这类正常收尾
+                # 也当成截断，误杀了不少本来合格的候选。
+                trunc1 = [int(t) != eos for t in gen[:, -1].tolist()]
                 cands = [s.strip().replace("\n", " ") for s in
                          self.tok.batch_decode(gen, skip_special_tokens=True)]
 
-                picks = {}
+                picks, weak = {}, {}
+                retry_idx = []
                 for i, (txt, ev, box) in enumerate(batch):
-                    pool = cands[i * self.N_CAND:(i + 1) * self.N_CAND]
-                    # 先排除「几乎没改」和各类不合格的，再挑分最高的
-                    good = [c for c in pool
-                            if not self._too_similar(txt, c) and self._cand_ok(txt, c)]
-                    best = max(good or pool, key=lambda c: self._rank(txt, c))
-                    # 数字最后统一还原：模型把 11 块写成十块、15 分钟写成
-                    # 十分钟这类改值错误，靠提示管不住，只能生成后改回来。
-                    picks[i] = self._restore_numbers(txt, best)
+                    lo = i * self.N_CAND
+                    pool = cands[lo:(i + 1) * self.N_CAND]
+                    tr1 = trunc1[lo:(i + 1) * self.N_CAND]
+                    # 先排除「几乎没改」、被截断、和其他不合格的
+                    good = [c for j, c in enumerate(pool)
+                            if not self._too_similar(txt, c)
+                            and self._cand_ok(txt, c) and not tr1[j]]
+                    if good:
+                        picks[i] = max(good, key=lambda c: self._rank(txt, c))
+                    else:
+                        retry_idx.append(i)
+
+                # 候选全没改（或全不合格）时，升温 + 明确要求换说法，重生成一次
+                if retry_idx:
+                    print(f"  [rewrite] {len(retry_idx)} 条候选没改到位，重生成",
+                          flush=True)
+                    hint = ("\n\n必须换一种说法，不能照抄原句："
+                            "句式、语序也要改，只换几个近义词不算。")
+                    rp = []
+                    for i in retry_idx:
+                        txt = batch[i][0]
+                        msgs = [{"role": "system", "content": self.SYSTEM},
+                                {"role": "user",
+                                 "content": self.TMPL.format(x=txt) + hint}]
+                        p = self.tok.apply_chat_template(
+                            msgs, tokenize=False, add_generation_prompt=True,
+                            enable_thinking=False)
+                        rp.extend([p] * self.N_CAND)
+                    enc2 = self.tok(rp, return_tensors="pt",
+                                    padding=True).to(self.model.device)
+                    with torch.inference_mode():
+                        out2 = self.model.generate(
+                            **enc2, max_new_tokens=mn, do_sample=True,
+                            temperature=1.15, top_p=0.95,
+                            pad_token_id=self.tok.eos_token_id)
+                    g2 = out2[:, enc2["input_ids"].shape[1]:]
+                    # 准确的截断信号：没以 EOS 结尾就说明撞上了 max_new
+                    eos = self.tok.eos_token_id
+                    trunc2 = [int(t) != eos for t in g2[:, -1].tolist()]
+                    cands2 = [s.strip().replace("\n", " ") for s in
+                              self.tok.batch_decode(g2, skip_special_tokens=True)]
+                    for k, i in enumerate(retry_idx):
+                        lo = k * self.N_CAND
+                        pool2 = cands2[lo:(k + 1) * self.N_CAND]
+                        tr2 = trunc2[lo:(k + 1) * self.N_CAND]
+                        txt = batch[i][0]
+                        good2 = [c for j, c in enumerate(pool2)
+                                 if not self._too_similar(txt, c)
+                                 and self._cand_ok(txt, c) and not tr2[j]]
+                        if good2:
+                            picks[i] = max(good2, key=lambda c: self._rank(txt, c))
+                        else:
+                            # 两次都改不动，如实返回并标记，别假装成功
+                            picks[i] = max(pool2 or
+                                           cands[i * self.N_CAND:(i + 1) * self.N_CAND],
+                                           key=lambda c: self._rank(txt, c))
+                            weak[i] = True
 
                 for i, (txt, ev, box) in enumerate(batch):
-                    box["out"] = picks[i]
+                    # 数字最后统一还原：模型把 11 块写成十块、15 分钟写成
+                    # 十分钟这类改值错误，靠提示管不住，只能生成后改回来。
+                    box["out"] = self._restore_numbers(txt, picks[i])
+                    box["weak"] = weak.get(i, False)
                     ev.set()
             except Exception as e:                    # noqa: BLE001
                 for _, ev, box in batch:
@@ -795,10 +870,11 @@ class Handler(BaseHTTPRequestHandler):
             if not REWRITER.load():
                 self._send(503, {"error": REWRITER.error or "lora unavailable"})
                 return
-            out = REWRITER.rewrite(text)
-            if not out:
+            got = REWRITER.rewrite(text)
+            if not got:
                 self._send(500, {"error": "generation failed"})
                 return
+            out, weak = got
             try:
                 ai_b = SCORER.describe(text)["ai_prob"]
                 ai_a = SCORER.describe(out)["ai_prob"]
@@ -807,7 +883,7 @@ class Handler(BaseHTTPRequestHandler):
             f_b = FISH.score([text])[0] if FISH else None
             f_a = FISH.score([out])[0] if FISH else None
             self._send(200, {
-                "text": text, "rewritten": out,
+                "text": text, "rewritten": out, "weak": weak,
                 "ai_before": round(ai_b, 4) if ai_b is not None else None,
                 "ai_before_pct": round(ai_percentile(ai_b), 1) if ai_b is not None else None,
                 "ai_after_pct": round(ai_percentile(ai_a), 1) if ai_a is not None else None,
