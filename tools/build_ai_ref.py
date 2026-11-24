@@ -9,7 +9,7 @@
 
 ## 为什么用新分类器算
 
-现在是 scorer_v3（手工特征 + 句向量）。百分位必须和实际打分的模型一致，
+现在是 scorer_v4（鲸鱼数据扩样本后重训）。百分位必须和实际打分的模型一致，
 否则「比 91% 的真人更高」这句话就是错的。
 """
 import json
@@ -28,7 +28,11 @@ import pipeline.features as F  # noqa: E402
 OUT = ROOT / "state" / "ai_ref.json"
 N = 1500
 
-z = np.load(ROOT / "state" / "scorer_v3.npz", allow_pickle=True)
+MODEL = ROOT / "state" / "scorer_v4.npz"
+if not MODEL.exists():
+    MODEL = ROOT / "state" / "scorer_v3.npz"
+print(f"  用 {MODEL.name} 计算参照分布")
+z = np.load(MODEL, allow_pickle=True)
 coef, b = z["coef"], float(z["intercept"][0])
 mean, std, cols = z["mean"], z["std"], [str(c) for c in z["cols"]]
 

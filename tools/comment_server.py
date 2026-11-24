@@ -91,8 +91,20 @@ FISH_MIN_LEN = 10
 # 取 0.80：换到随机评论流时误伤降到 6.6%，标注集上召回仍是 100%。
 # 0.50（这篇报告默认的「最佳阈值 0.43」那一档）在真实评论流里误伤太高，
 # 在浏览器逐条显示的场合体感很差——它适合批量筛查，不适合逐条定罪。
-AI_HIGH = 0.80      # ≥ 判红（AI 嫌疑）
-AI_LOW = 0.50       # 0.50~0.80 判黄，<0.50 判绿
+# 阈值改用**百分位**，不再用概率。
+#
+# 换用 scorer v4 之后概率尺度变了：大肥鱼一条评论的概率只有 0.60，但它在
+# 真人参照分布里已经排到 94.7 分位。按老的概率阈值 0.80 判，会被评成
+# 「medium」而不是「high」，等于漏报。
+#
+# 百分位是可解释的：AI 分位 90 表示「比 90% 的真人评论更像 AI」。
+# 在 40 条确认真人评论上实测：
+#     阈值 80 分位 → 误判 28%
+#     阈值 90 分位 → 误判  5%
+#     阈值 95 分位 → 误判  0%
+# 取 90/70：漏报和误伤都比较能接受，逐条显示时体感不至于满屏红色。
+AI_HIGH_PCT = 90.0      # ≥ 判红（AI 嫌疑）
+AI_LOW_PCT = 70.0       # 70~90 判黄，<70 判绿
 
 
 def level(v: float, lo: float, hi: float) -> str:
@@ -870,7 +882,7 @@ class Handler(BaseHTTPRequestHandler):
             "lora": REWRITER is not None and REWRITER.model is not None,
             "lora_adapter": REWRITER.adapter if REWRITER else None,
             "lora_error": REWRITER.error if REWRITER else None,
-            "thresholds": {"ai": [AI_LOW, AI_HIGH], "fish": [FISH_LOW, FISH_HIGH]},
+            "thresholds": {"ai_pct": [AI_LOW_PCT, AI_HIGH_PCT], "fish": [FISH_LOW, FISH_HIGH]},
         })
 
     def do_POST(self) -> None:                  # noqa: N802
@@ -910,8 +922,7 @@ class Handler(BaseHTTPRequestHandler):
                 rows.append({
                     "text": t,
                     "ai_prob": round(a, 4), "ai_pct": round(apct, 1),
-                    "ai_level": ("high" if a >= AI_HIGH
-                                  else ("medium" if a >= AI_LOW else "low")),
+                    "ai_level": level(apct, AI_LOW_PCT, AI_HIGH_PCT),
                     "fish_prob": round(f, 4),
                     "fish_pct": round(pct, 1) if pct is not None else None,
                     "fish_level": (level(pct, FISH_LOW, FISH_HIGH)
@@ -976,12 +987,15 @@ def main() -> int:
     load_ai_reference()
     print("  [ai] 分类器就绪", flush=True)
 
-    CLF3 = ClassifierV3(ROOT / "state" / "scorer_v3.npz")
+    SCORER_PATH = ROOT / "state" / "scorer_v4.npz"
+    if not SCORER_PATH.exists():
+        SCORER_PATH = ROOT / "state" / "scorer_v3.npz"
+    CLF3 = ClassifierV3(SCORER_PATH)
     if CLF3.ok:
         auc = (" AUC=%.3f" % CLF3.cv_auc) if CLF3.cv_auc else ""
-        print(f"  [ai-v3] 句向量分类器就绪{auc}", flush=True)
+        print(f"  [ai] {SCORER_PATH.name} 就绪{auc}", flush=True)
     else:
-        print(f"  [ai-v3] 未启用：{CLF3.err}（退回手工特征）", flush=True)
+        print(f"  [ai] 未启用：{CLF3.err}（退回手工特征）", flush=True)
 
     FISH = FishDetector()
     REWRITER = Rewriter(a.adapter if a.lora else None)
