@@ -303,11 +303,13 @@ class Rewriter:
     def _too_similar(self, a: str, b: str, thr: float = 0.60) -> bool:
         """输出和输入几乎一样 → 判定为「没改」。
 
-        阈值原来是 0.85，太松了。v4 训练数据里「输入 vs 真人目标」的
-        相似度中位是 0.29、P90 是 0.40，而 0.78、0.84 这种只换几个近义词的
-        输出能轻松通过 0.85 —— 实测用户拿到的就是这么两条：
+        阈值原来是 0.85，太松了。用户拿到的就是这么两条：
           「拼一块→黏一块」「想法→意思」           相似度 0.78
           「只删掉句尾的『啊。』」                  相似度 0.84
+        也不能放太松：实测放到 0.72，大改率从 98% 掉到 85%——因为
+        0.60~0.72 那批「半改不改」的候选被放进来，挤掉了重试产出的好结果。
+        所以过滤用 0.60 逼它重试；「weak 标记」另用一个更松的 0.72，
+        只在那条确实肉眼可见没怎么变时才提示用户。
         """
         A, B = self._bigrams(a), self._bigrams(b)
         if not (A | B):
@@ -405,7 +407,8 @@ class Rewriter:
     # 数字后面跟的量词。只比数字不够：「11块 → 十一点」数字是对的，
     # 但把价格变成了时间，必须连量词一起看。
     _UNITS = ("块元角分年月日个只条次碗斤米秒点张件份套本台部杯包瓶袋双对成"
-              "遍回轮层位名岁周期集章页支场局盘球拍页")
+              "遍回轮层位名岁周期集章页支场局盘球拍页"
+              "万亿千百十")   # 万/亿/十/百/千："520 万" 曾被打成"五十万"
 
     @classmethod
     def _restore_numbers(cls, src: str, out: str) -> str:
@@ -420,10 +423,14 @@ class Rewriter:
         某个找不到就跳过，不整体放弃——模型经常少写或多写几个数字。
         """
         items = []
-        for n, nxt in re.findall(r"(\d+)\s*(.)?", src):
+        # 这里只处理阿拉伯数字。汉字数字（「三块五」）不在还原范围内：
+        # 试过把「一块三」还原成源文的「三块五」，结果输出了「三块三」——
+        # 三块五的「五」不带量词，抓不到。与其猜错，不如在 _cand_ok 里
+        # 直接否决「汉字数字和源文不一致」的候选，让它重生成。
+        for tok, nxt in re.findall(r"(\d+)\s*(.)?", src):
             unit = nxt if nxt and nxt in cls._UNITS else (
                 "%" if nxt == "%" else "")
-            items.append((n, unit))
+            items.append((tok, unit))
 
         cursor = 0
         pieces = []
@@ -523,7 +530,37 @@ class Rewriter:
             return False
         # 数字不在过滤阶段管：模型把 11 写成十、15 写成十是常态，
         # 用这条否决会把好候选也杀掉。改在生成后由 _restore_numbers 修。
+        #
+        # 内容保留要有下限。打分里「保留」只占 0.3 权重，没有下限时会挑出
+        # 「改得很像人但把观点删光了」的候选，实测有一条：
+        #   原 最后一句：你无聊是因为你选择如此。有点狠，但没毛病。
+        #   改 末尾那句挺狠，但不犯法。          ← 保留率 0.05
+        if self._content_recall(src, cand) < 0.30:
+            return False
+        # 汉字数字不许改值。实测「瓦罐汤当地三块五」→「一块三」（3.5 变 1.3），
+        # 这类错误比「改得少」严重得多，宁可否决让模型重生成。
+        # 做法是比对「汉字数字+量词」的多重集合：源文有 [三块, 十块]，
+        # 输出变成 [一块, 十块] 就否决。源文没有这类词组时完全不介入，
+        # 所以「大家一起走」这种不会被误伤。
+        if not self._cn_units_ok(src, cand):
+            return False
         return True
+
+    # 「五十种」「三块」这类词组用到的量词比数字用得宽（种、类、家…），
+    # 跟数字还原用的 _UNITS 不是一回事，单独一份。
+    _CN_UNITS = _UNITS + "种类家位名岁级届轮期章节页项条倍层"
+
+    @classmethod
+    def _cn_pairs(cls, t: str) -> list[str]:
+        return [a + b for a, b in re.findall(
+            r"([零〇一二两三四五六七八九十百千]+)\s*([" + cls._CN_UNITS + r"])", t)]
+
+    @classmethod
+    def _cn_units_ok(cls, src: str, cand: str) -> bool:
+        sp = cls._cn_pairs(src)
+        if not sp:
+            return True
+        return sorted(sp) == sorted(cls._cn_pairs(cand))
 
     def _rep_penalty(self, s: str) -> float:
         """重复退化惩罚。实测重排会挑出「点歪和点歪都是说法」这种病句。"""
@@ -736,7 +773,10 @@ class Rewriter:
                             picks[i] = max(pool2 or
                                            cands[i * self.N_CAND:(i + 1) * self.N_CAND],
                                            key=lambda c: self._rank(txt, c))
-                            weak[i] = True
+                            # 只在真的肉眼没变时才报 weak。
+                            # 过滤用 0.60 是为了逼重试，但 0.60~0.72 之间
+                            # 的改动用户是看得见的，不该标成「改不动」。
+                            weak[i] = self._sim(txt, picks[i]) >= 0.72
 
                 for i, (txt, ev, box) in enumerate(batch):
                     # 数字最后统一还原：模型把 11 块写成十块、15 分钟写成
