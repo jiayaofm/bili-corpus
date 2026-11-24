@@ -338,7 +338,7 @@ class Rewriter:
     #   3 选 1    0.534 (+10.8%)  内容保留已追平 4 选 1
     #   4 选 1    0.534 (+14.2%)  只多赚语法分
     # 默认取 2；想要更好质量用 --cand 3 或 4。
-    N_CAND = 2
+    N_CAND = 4
     # 压逗号在离线实验里只多 1.9 个点（0.534→0.543），实测却会把逗号换成空格、
     # 还诱发了重复退化（点歪歪点歪歪）。收益太小、副作用太明显，默认关掉。
     COMMA_BIAS = 0.0
@@ -535,10 +535,28 @@ class Rewriter:
         c = Counter(bg)
         return sum(max(0, v - 2) for v in c.values()) * 0.03
 
+    def _sim(self, a: str, b: str) -> float:
+        """字符 bigram 的 Jaccard 相似度。"""
+        A, B = self._bigrams(a), self._bigrams(b)
+        return len(A & B) / len(A | B) if (A | B) else 1.0
+
+    # 真人改写后与原文的相似度中位 0.29、P90 0.40（v4 训练数据实测）。
+    # 「改多少」是有客观目标值的：太像=没改，太不像=跑题。
+    TARGET_SIM = 0.29
+
     def _rank(self, src: str, cand: str) -> float:
-        """候选打分：语法像人话 + 内容保留 − 重复惩罚。"""
-        return (0.6 * human_score(cand)
-                + 0.4 * self._content_recall(src, cand)
+        """候选打分：像人话 + 内容保留 + 改写幅度贴近真人分布 − 重复惩罚。
+
+        第三项是关键，别删。原来的 0.6×像人话 + 0.4×保留 完全不惩罚照抄：
+        在 20 条真实评论上实测「太像输入(≥0.6)」占 10/20，合格率仅 25%，
+        而且把候选数从 2 加到 6 毫无改善——选择函数永远挑最像的那条。
+        加上改写幅度项后（N=4）：太像 2/20，合格率 85%。
+        """
+        s = self._sim(src, cand)
+        div = 1.0 - min(1.0, abs(s - self.TARGET_SIM) / self.TARGET_SIM)
+        return (0.40 * human_score(cand)
+                + 0.30 * self._content_recall(src, cand)
+                + 0.30 * div
                 - self._rep_penalty(cand))
 
     def _content_recall(self, src: str, out: str) -> float:
@@ -903,7 +921,7 @@ def main() -> int:
     sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8849)
-    ap.add_argument("--cand", type=int, default=2,
+    ap.add_argument("--cand", type=int, default=4,
                     help="改写时生成几条候选再重排：1=不重排，2~4 越大越慢但越好")
     ap.add_argument("--lora", action="store_true", help="同时加载改写模型（占显存）")
     ap.add_argument("--adapter", default=str(Path(r"D:\dsh-ai\lora\out\fish-a2")))
