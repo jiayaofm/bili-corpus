@@ -70,7 +70,11 @@ for r in rows:
         w = (p.get("rewrite") or "").strip()
         ok, why = usable(o, w)
         if ok:
-            keep.append({"x": o, "y": w, "bvid": bv})
+            # 方向：输入是鱼的改写（有鱼腥味），目标是真人原话。
+            # 2026-11-25 修：原来写成 x=origin, y=rewrite，等于教模型
+            # 「人话 → 鱼话」，和「去鱼腥味」的目标正好相反。
+            # 当时没发现，是因为只盯着「改写幅度」这个指标，方向错了看不出来。
+            keep.append({"x": w, "y": o, "bvid": bv})
         else:
             reasons[why] = reasons.get(why, 0) + 1
     if keep:
