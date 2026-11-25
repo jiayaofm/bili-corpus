@@ -549,6 +549,16 @@ class Rewriter:
         #   改 末尾那句挺狠，但不犯法。          ← 保留率 0.05
         if self._content_recall(src, cand) < 0.30:
             return False
+        # 不许凭空冒出英文单词。实测代价：
+        #   「细节我记不太清」被改成「大概我没记 right」——中文句子里夹一个英文词，
+        #   这种错误人一眼就能看出不对，但规则以外没有任何办法自动发现。
+        # 只拦「输入里没有、输出里冒出来」的英文词，输入自带的英文照原样放行。
+        import re as _re
+        _en = _re.compile(r"[A-Za-z]{2,}")
+        src_en = {w.lower() for w in _en.findall(src)}
+        weird = {w.lower() for w in _en.findall(cand)} - src_en - self._EN_OK
+        if weird:
+            return False
         # 汉字数字不许改值。实测「瓦罐汤当地三块五」→「一块三」（3.5 变 1.3），
         # 这类错误比「改得少」严重得多，宁可否决让模型重生成。
         # 做法是比对「汉字数字+量词」的多重集合：源文有 [三块, 十块]，
@@ -561,6 +571,12 @@ class Rewriter:
     # 「五十种」「三块」这类词组用到的量词比数字用得宽（种、类、家…），
     # 跟数字还原用的 _UNITS 不是一回事，单独一份。
     _CN_UNITS = _UNITS + "种类家位名岁级届轮期章节页项条倍层"
+
+    # 允许凭空出现的英文词：站内黑话、单位、常见缩写。
+    # 不在这里面的英文词冒出来，就当成模型串词了。
+    _EN_OK = {"up", "ai", "ok", "doge", "cpu", "gpu", "vtuber", "mbti",
+              "cv", "op", "ed", "pv", "bgm", "dd", "yyds", "tiktok", "bilibili",
+              "app", "pr", "pe", "ae", "vr", "ar", "hdr", "4k", "8k", "hifi"}
 
     @classmethod
     def _cn_pairs(cls, t: str) -> list[str]:
@@ -649,7 +665,14 @@ class Rewriter:
             print(f"  [lora] 失败：{self.error}", flush=True)
             return False
 
-    def rewrite(self, text: str, timeout: float = 90.0) -> tuple[str, bool] | None:
+    # 改写强度。conservative 只换措辞、不动逻辑结构，
+    # 用来解决「改多了前后句语义不通」。
+    CONSERVATIVE = ("\n\n只换措辞，不许动逻辑：连接词、因果、转折、否定、"
+                    "顺序一律保持原样。句子可以合并或拉长，但不能删掉任何一环，"
+                    "也不能改变任何一句的意思。")
+
+    def rewrite(self, text: str, timeout: float = 90.0,
+                mode: str = "normal") -> tuple[str, bool] | None:
         """把一个改写请求丢进队列，等批量工作线程回结果。
 
         为什么排队而不直接生成：模型一次只能跑一个，
@@ -666,7 +689,7 @@ class Rewriter:
         self._ensure_worker()
         ev = threading.Event()
         box = {"out": None, "err": None, "weak": False}
-        self.q.put((text, ev, box))
+        self.q.put((text, ev, box, mode))
         if not ev.wait(timeout):
             return None
         if box["err"]:
@@ -694,9 +717,11 @@ class Rewriter:
                 self.tok.padding_side = "left"
                 # 每条请求生成 N_CAND 个候选，最后挑一个
                 prompts = []
-                for text, _, _ in batch:
+                for text, _, _, rmode in batch:
                     msgs = [{"role": "system", "content": self.SYSTEM},
                             {"role": "user", "content": self.TMPL.format(x=text)}]
+                    if rmode == "conservative":
+                        msgs[-1]["content"] += self.CONSERVATIVE
                     p = self.tok.apply_chat_template(
                         msgs, tokenize=False, add_generation_prompt=True,
                         enable_thinking=False)
@@ -710,7 +735,7 @@ class Rewriter:
                 procs = ([self._demote_proc(self.comma_ids, self.COMMA_BIAS)]
                          if self.COMMA_BIAS else None)
 
-                mn = self._max_new([t for t, _, _ in batch])
+                mn = self._max_new([t for t, _, _, _ in batch])
                 enc = self.tok(prompts, return_tensors="pt", padding=True).to(self.model.device)
                 with torch.inference_mode():
                     out = self.model.generate(**enc, max_new_tokens=mn, do_sample=True,
@@ -728,7 +753,7 @@ class Rewriter:
 
                 picks, weak = {}, {}
                 retry_idx = []
-                for i, (txt, ev, box) in enumerate(batch):
+                for i, (txt, ev, box, rmode) in enumerate(batch):
                     lo = i * self.N_CAND
                     pool = cands[lo:(i + 1) * self.N_CAND]
                     tr1 = trunc1[lo:(i + 1) * self.N_CAND]
@@ -790,14 +815,14 @@ class Rewriter:
                             # 的改动用户是看得见的，不该标成「改不动」。
                             weak[i] = self._sim(txt, picks[i]) >= 0.72
 
-                for i, (txt, ev, box) in enumerate(batch):
+                for i, (txt, ev, box, rmode) in enumerate(batch):
                     # 数字最后统一还原：模型把 11 块写成十块、15 分钟写成
                     # 十分钟这类改值错误，靠提示管不住，只能生成后改回来。
                     box["out"] = self._restore_numbers(txt, picks[i])
                     box["weak"] = weak.get(i, False)
                     ev.set()
             except Exception as e:                    # noqa: BLE001
-                for _, ev, box in batch:
+                for _, ev, box, _rmode in batch:
                     box["err"] = f"{type(e).__name__}: {e}"
                     ev.set()
 
@@ -933,13 +958,16 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/rewrite":
             text = (payload.get("text") or "").strip()
+            rmode = payload.get("mode") or "normal"
+            if rmode not in ("normal", "conservative"):
+                rmode = "normal"
             if not text:
                 self._send(400, {"error": "no text"})
                 return
             if not REWRITER.load():
                 self._send(503, {"error": REWRITER.error or "lora unavailable"})
                 return
-            got = REWRITER.rewrite(text)
+            got = REWRITER.rewrite(text, mode=rmode)
             if not got:
                 self._send(500, {"error": "generation failed"})
                 return
